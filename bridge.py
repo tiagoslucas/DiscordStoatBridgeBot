@@ -260,7 +260,8 @@ def interactive_env_setup() -> None:
     load_dotenv(ENV_FILE, override=True)
 
 
-interactive_env_setup()
+if __name__ == "__main__":
+    interactive_env_setup()
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
