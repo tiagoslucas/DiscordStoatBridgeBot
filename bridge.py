@@ -389,7 +389,7 @@ forwarding messages between both platforms in real time.
 • **No** messages are stored permanently on the bot's server.
 
 **Deletion:**
-If you delete a message, it will automatically be deleted on the other platform as well.
+If you delete your message on Stoat, it is also deleted on Discord. Messages deleted on Discord stay on Stoat, marked with a strikethrough.
 
 If you don't want to use the bridge / your messages to be transfered, simply stop writing in the bridged channel — \
 your messages will not be forwarded.
@@ -408,7 +408,7 @@ forwarding messages between both platforms in real time.
 • **No** messages are stored permanently on the bot's server.
 
 **Deletion:**
-If you delete a message, it will automatically be deleted on the other platform as well.
+If you delete your message here on Discord, it stays on Stoat but is marked with a strikethrough there. Messages written on Stoat are deleted on Discord when deleted on Stoat.
 
 If you don't want to use the bridge / your messages to be transfered, simply stop writing in the bridged channel — \
 your messages will not be forwarded.
@@ -421,15 +421,12 @@ your messages will not be forwarded.
 discord_webhooks: dict[int, discord.Webhook] = {}
 stoat_channels:  dict[str, object]           = {}
 
-_d2s: OrderedDict[int, str] = OrderedDict()   # discord_msg_id → stoat_msg_id
-_s2d: OrderedDict[str, int] = OrderedDict()   # stoat_msg_id   → discord_msg_id
+_d2s: OrderedDict[int, str] = OrderedDict()   # discord_msg_id → stoat_msg_id (replies + strikethrough)
+_s2d: OrderedDict[str, int] = OrderedDict()   # stoat_msg_id   → discord_msg_id (deletion mirroring)
 
-# Used in on_message_delete to choose the right deletion method.
+# Discord message IDs created by our webhooks, i.e. mirrors of Stoat-native
+# messages. Only these may be deleted on Discord when the Stoat original goes.
 _webhook_discord_ids: set[int] = set()
-
-# used to break deletion loops.
-_discord_deleting: set[int] = set()   # discord msg IDs
-_stoat_deleting:   set[str] = set()   # stoat   msg IDs
 
 
 def _cache_pair(discord_id: int, stoat_id: str, *, from_webhook: bool = False) -> None:
@@ -577,31 +574,32 @@ async def fetch_stoat_message(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  STOAT MESSAGE DELETION HELPER
+#  STOAT MESSAGE EDIT HELPER
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-async def delete_stoat_message(channel_id: str, message_id: str, stoat_client: "StoatBot") -> bool:
-    """Delete a message on Stoat via direct REST call with the bot token."""
+async def edit_stoat_message(channel_id: str, message_id: str, content: str, stoat_client: "StoatBot") -> bool:
+    """Edit a bot-sent message on Stoat via REST (used to strike through deleted Discord messages)."""
     session = stoat_client._http_session
     if session is None:
-        logger.warning("delete_stoat_message: HTTP session not ready")
+        logger.warning("edit_stoat_message: HTTP session not ready")
         return False
     try:
-        async with session.delete(
+        async with session.patch(
             f"{REVOLT_API_URL}/channels/{channel_id}/messages/{message_id}",
             headers={"x-bot-token": STOAT_BOT_TOKEN},
+            json={"content": content[:2000]},
         ) as resp:
             if resp.status in (200, 204):
                 return True
             body = await resp.text()
             logger.warning(
-                f"delete_stoat_message: HTTP {resp.status} for "
+                f"edit_stoat_message: HTTP {resp.status} for "
                 f"{channel_id}/{message_id} – {body[:200]}"
             )
             return False
     except Exception as exc:
-        logger.error(f"delete_stoat_message: {channel_id}/{message_id}: {exc}")
+        logger.error(f"edit_stoat_message: {channel_id}/{message_id}: {exc}")
         return False
 
 
@@ -716,7 +714,6 @@ class StoatBot(stoat.Client):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._http_session: aiohttp.ClientSession | None = None
-        self._discord_bot: "DiscordBot | None" = None  # set in main()
         self._healthpulse: bool = False
         self._health_msg_id: str | None = None
         self._planned_restart: bool = False  # set by _do_restart(); read by the supervisor in main()
@@ -941,87 +938,35 @@ class StoatBot(stoat.Client):
     # ── Message deletion: Stoat → delete on Discord ───────────────────────────
 
     async def on_message_delete(self, event, /):
-        """When a Stoat message is deleted, remove the mirrored Discord message."""
+        """A Stoat-native message was deleted → remove its Discord mirror.
+
+        Mirrors of Discord-user messages are never touched from the Stoat side:
+        Stoat is the archive, the Discord original must stay.
+        """
         try:
-            msg_id     = _extract_id(getattr(event, "message_id", None) or getattr(event, "id", None))
-            channel_id = _extract_id(getattr(event, "channel_id", None))
-
+            msg_id = _extract_id(
+                getattr(event, "message_id", None) or getattr(event, "id", None)
+            )
             if msg_id is None:
-                # Some library versions give us the full message object
-                msg_obj    = getattr(event, "message", None)
-                msg_id     = _extract_id(msg_obj)
-                channel_id = channel_id or _extract_id(getattr(msg_obj, "channel", None))
-
+                msg_id = _extract_id(getattr(event, "message", None))
             if msg_id is None:
-                return
-
-            # Loop-break: if we triggered this deletion ourselves, ignore it.
-            if msg_id in _stoat_deleting:
-                _stoat_deleting.discard(msg_id)
                 return
 
             discord_msg_id = _s2d.get(str(msg_id))
             if discord_msg_id is None:
-                return  # Not a bridged message
+                return  # not a bridged message
+            if discord_msg_id not in _webhook_discord_ids:
+                return  # Discord-user original mirrored on Stoat – hands off
 
-            # Resolve the Discord channel ID
-            stoat_ch_id   = channel_id or next(
-                (s for s, d in STOAT_TO_DISCORD.items() if d in discord_webhooks), None
-            )
-            discord_ch_id = STOAT_TO_DISCORD.get(stoat_ch_id) if stoat_ch_id else None
-
-            _discord_deleting.add(discord_msg_id)
-
-            # ── Case 1: message was originally sent via webhook (Stoat→Discord) ──
-            if discord_msg_id in _webhook_discord_ids:
-                webhook = discord_webhooks.get(discord_ch_id) if discord_ch_id else None
-                if webhook is None:
-                    # Fall back: try every webhook
-                    for _, wh in discord_webhooks.items():
-                        try:
-                            await wh.delete_message(discord_msg_id)
-                            _webhook_discord_ids.discard(discord_msg_id)
-                            return
-                        except discord.NotFound:
-                            _discord_deleting.discard(discord_msg_id)
-                            return
-                        except Exception:
-                            pass
-                    _discord_deleting.discard(discord_msg_id)
-                    return
+            for wh in discord_webhooks.values():
                 try:
-                    await webhook.delete_message(discord_msg_id)
-                    _webhook_discord_ids.discard(discord_msg_id)
+                    await wh.delete_message(discord_msg_id)
+                    break
                 except discord.NotFound:
-                    _discord_deleting.discard(discord_msg_id)
-                    logger.debug(f"Discord webhook message {discord_msg_id} already gone")
-                except Exception as exc:
-                    _discord_deleting.discard(discord_msg_id)
-                    logger.error(f"Stoat -> Discord: could not delete webhook msg {discord_msg_id}: {exc}")
-
-            # ── Case 2: message was originally sent by a Discord user (Discord→Stoat) ──
-            else:
-                if self._discord_bot is None or discord_ch_id is None:
-                    logger.warning(
-                        "Stoat -> Discord: cannot delete user message – "
-                        "discord_bot reference or channel ID missing"
-                    )
-                    _discord_deleting.discard(discord_msg_id)
-                    return
-                try:
-                    ch = (
-                        self._discord_bot.get_channel(discord_ch_id)
-                        or await self._discord_bot.fetch_channel(discord_ch_id)
-                    )
-                    msg = ch.get_partial_message(discord_msg_id)
-                    await msg.delete()
-                except discord.NotFound:
-                    _discord_deleting.discard(discord_msg_id)
-                    logger.debug(f"Discord user message {discord_msg_id} already gone")
-                except Exception as exc:
-                    _discord_deleting.discard(discord_msg_id)
-                    logger.error(f"Stoat -> Discord: could not delete user msg {discord_msg_id}: {exc}")
-
+                    break  # already gone
+                except Exception:
+                    continue  # try the next webhook
+            _webhook_discord_ids.discard(discord_msg_id)
         except Exception as exc:
             logger.error(f"on_message_delete (Stoat): unexpected error: {exc}")
 
@@ -1041,7 +986,7 @@ class DiscordBot(commands.Bot):
         intents.members         = True
         super().__init__(command_prefix="!", intents=intents)
 
-        # Keep a reference to the StoatBot so we can call delete on it
+        # Set by the Stoat supervisor in main(); used to edit Stoat messages
         self._stoat_bot: StoatBot | None = None
 
     async def setup_hook(self):
@@ -1179,35 +1124,110 @@ class DiscordBot(commands.Bot):
         except Exception as exc:
             logger.error(f"Discord -> Stoat (channel {stoat_id}): {exc}")
 
-    # ── Message deletion: Discord → delete on Stoat ───────────────────────────
+    # ── Message deletion: Discord → strikethrough on Stoat ────────────────────
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
-        """When any Discord message is deleted remove the mirrored Stoat message."""
-        discord_msg_id = payload.message_id
+        """A Discord message was deleted → strike through its Stoat mirror.
 
-        # Loop-break: if triggered on ourselves, ignore it.
-        if discord_msg_id in _discord_deleting:
-            _discord_deleting.discard(discord_msg_id)
+        Stoat is the archive: the content stays, marked as deleted.
+        """
+        if payload.channel_id not in DISCORD_TO_STOAT:
             return
-
-        discord_ch_id = payload.channel_id
-        if discord_ch_id not in DISCORD_TO_STOAT:
-            return
-
-        stoat_msg_id = _d2s.get(discord_msg_id)
+        stoat_msg_id = _d2s.get(payload.message_id)
         if stoat_msg_id is None:
-            return  # Not a bridged message
-
-        stoat_ch_id = DISCORD_TO_STOAT[discord_ch_id]
+            return  # not a bridged message, or older than the ID cache
 
         if self._stoat_bot is None:
-            logger.warning("Discord -> Stoat: _stoat_bot reference not set, cannot delete")
+            logger.warning("Discord -> Stoat: _stoat_bot reference not set, cannot strikethrough")
             return
 
-        _stoat_deleting.add(stoat_msg_id)
-        success = await delete_stoat_message(stoat_ch_id, stoat_msg_id, self._stoat_bot)
-        if not success:
-            _stoat_deleting.discard(stoat_msg_id)
+        stoat_ch_id = DISCORD_TO_STOAT[payload.channel_id]
+        orig = await fetch_stoat_message(stoat_ch_id, stoat_msg_id, self._stoat_bot)
+        content = (orig.content if orig else "") or "🗑 deleted on Discord"
+        # per line: markdown strikethrough does not span paragraphs
+        struck = "\n".join(
+            f"~~{line}~~" if line.strip() else line for line in content.split("\n")
+        )
+        await edit_stoat_message(stoat_ch_id, stoat_msg_id, struck, self._stoat_bot)
+
+    # ── Channel lifecycle: Discord → Stoat ────────────────────────────────────
+    #  Channels created on Stoat are NOT created on Discord, and channels
+    #  deleted on either side are NOT deleted on the other: Stoat is the
+    #  archive, its structure only follows Discord's growth.
+
+    async def on_guild_channel_create(self, channel):
+        """A text channel created on Discord is mirrored and bridged on Stoat."""
+        if not isinstance(channel, discord.TextChannel):
+            return
+        if channel.id in DISCORD_TO_STOAT:
+            return
+        stoat_bot = self._stoat_bot
+        if stoat_bot is None or stoat_bot._http_session is None or not STOAT_CHANNEL_IDS:
+            logger.warning("Discord -> Stoat: channel create ignored – Stoat not ready yet")
+            return
+        # Only mirror channels in the guild we are bridging.
+        bridged_guilds = {
+            c.guild.id
+            for c in (self.get_channel(i) for i in DISCORD_CHANNEL_IDS)
+            if isinstance(c, discord.TextChannel)
+        }
+        if channel.guild.id not in bridged_guilds:
+            return
+
+        session = stoat_bot._http_session
+        headers = {"x-bot-token": STOAT_BOT_TOKEN}
+        try:
+            # The Stoat server that hosts our bridged channels.
+            async with session.get(
+                f"{REVOLT_API_URL}/channels/{STOAT_CHANNEL_IDS[0]}", headers=headers
+            ) as resp:
+                resp.raise_for_status()
+                server_id = (await resp.json()).get("server")
+            if not server_id:
+                logger.error("Discord -> Stoat: could not determine the Stoat server id")
+                return
+            async with session.post(
+                f"{REVOLT_API_URL}/servers/{server_id}/channels",
+                headers=headers,
+                json={"name": channel.name, "description": f"Mirror of Discord #{channel.name}"},
+            ) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    logger.error(f"Discord -> Stoat: channel create failed: HTTP {resp.status} – {body[:200]}")
+                    return
+                new_id = (await resp.json()).get("_id")
+            if not new_id:
+                logger.error("Discord -> Stoat: no channel id in create response")
+                return
+        except Exception as exc:
+            logger.error(f"Discord -> Stoat: channel create error: {exc}")
+            return
+
+        # Wire the new pair into the live bridge.
+        try:
+            stoat_channels[new_id] = await stoat_bot.fetch_channel(new_id)
+        except Exception as exc:
+            logger.error(f"Discord -> Stoat: could not fetch new Stoat channel {new_id}: {exc}")
+            return
+        DISCORD_CHANNEL_IDS.append(channel.id)
+        STOAT_CHANNEL_IDS.append(new_id)
+        CHANNEL_DIRECTIONS.append("bi")
+        DISCORD_TO_STOAT[channel.id] = new_id
+        STOAT_TO_DISCORD[new_id] = channel.id
+        try:
+            discord_webhooks[channel.id] = await channel.create_webhook(name="Stoat Bridge")
+        except Exception as exc:
+            logger.error(f"Discord -> Stoat: webhook for new channel #{channel.name} failed: {exc}")
+
+        # Persist the pair so it survives a restart.
+        try:
+            set_key(str(ENV_FILE), "DISCORD_CHANNEL_IDS", ", ".join(str(i) for i in DISCORD_CHANNEL_IDS))
+            set_key(str(ENV_FILE), "STOAT_CHANNEL_IDS",   ", ".join(STOAT_CHANNEL_IDS))
+            set_key(str(ENV_FILE), "CHANNEL_DIRECTIONS",  ", ".join(CHANNEL_DIRECTIONS))
+        except Exception as exc:
+            logger.error(f"Discord -> Stoat: could not persist the new pair to {ENV_FILE}: {exc}")
+
+        logger.info(f"Discord -> Stoat: mirrored #{channel.name} as Stoat channel {new_id} and bridged it")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1231,7 +1251,6 @@ async def _run_stoat_supervisor(discord_bot: "DiscordBot") -> None:
             http_base=REVOLT_API_URL,
             websocket_base=REVOLT_WS_URL,
         )
-        stoat_bot._discord_bot = discord_bot
         discord_bot._stoat_bot = stoat_bot
 
         planned = False

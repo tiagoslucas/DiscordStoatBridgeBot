@@ -160,7 +160,15 @@ The Discord channel ID must be one of the pairs in your `.env`. Run it **before*
 ## Notes
 - The bridge creates a webhook named `Stoat Bridge` in your Discord channel automatically. If one already exists from a previous run it will be reused.
 - Messages originating from the bridge webhook are ignored to prevent forwarding loops.
-- Message deletion is synced in both directions. If a message is deleted on one platform it is automatically removed on the other.
+- **Deletion behaviour (Stoat is the Discord archive):**
+  - A message deleted on **Discord** stays on Stoat, struck through (`~~like this~~`), so the archive keeps the content while showing it was deleted.
+  - A **Stoat-native** message deleted on Stoat is also deleted on Discord.
+  - Deleting a *mirrored* message on Stoat never removes the Discord original.
+  - Deletion handling only covers the last 500 bridged messages (the ID cache size); older ones are ignored.
+- **Channel lifecycle (Stoat's structure follows Discord's growth):**
+  - A text channel created on Discord is automatically created on Stoat, bridged, and persisted to `.env` (so it survives restarts).
+  - Channels created on Stoat are **not** created on Discord.
+  - Channels deleted on either side are **not** deleted on the other.
 - Stoat custom emoji names are resolved via the Stoat API and cached in memory for the duration of the process.
 - First-time users on both platforms receive a one-time DM explaining what the bridge does and how their messages are handled.
 
