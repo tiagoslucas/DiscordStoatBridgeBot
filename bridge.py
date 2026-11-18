@@ -611,9 +611,15 @@ async def _resolve_stoat_user(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _strike_through(content: str) -> str:
+    """Markdown strikethrough, per line (it does not span paragraphs)."""
+    return "\n".join(
+        f"~~{line}~~" if line.strip() else line for line in content.split("\n")
+    )
+
+
 async def edit_stoat_message(channel_id: str, message_id: str, content: str, stoat_client: "StoatBot") -> bool:
-    """Edit a bot-sent message on Stoat via REST (used to strike through deleted Discord messages)."""
-    session = stoat_client._http_session
+    """Edit a bot-sent message on Stoat via REST (used to strike through deleted Discord messages)."""    session = stoat_client._http_session
     if session is None:
         logger.warning("edit_stoat_message: HTTP session not ready")
         return False
@@ -1867,11 +1873,51 @@ class DiscordBot(commands.Bot):
         stoat_ch_id = DISCORD_TO_STOAT[payload.channel_id]
         orig = await fetch_stoat_message(stoat_ch_id, stoat_msg_id, self._stoat_bot)
         content = (orig.content if orig else "") or "🗑 deleted on Discord"
-        # per line: markdown strikethrough does not span paragraphs
-        struck = "\n".join(
-            f"~~{line}~~" if line.strip() else line for line in content.split("\n")
+        await edit_stoat_message(stoat_ch_id, stoat_msg_id, _strike_through(content), self._stoat_bot)
+
+    # ── Message edits: Discord → strike-through update on Stoat ────────────────
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        """A Discord message was edited → update its Stoat mirror in place:
+        the previous version struck through, the new version below it."""
+        if payload.channel_id not in DISCORD_TO_STOAT:
+            return
+        stoat_msg_id = _d2s.get(payload.message_id)
+        if stoat_msg_id is None:
+            return  # not a bridged message, or older than the ID cache
+        stoat_bot = self._stoat_bot
+        if stoat_bot is None:
+            return
+        channel = self.get_channel(payload.channel_id)
+        if channel is None:
+            return
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        if msg.author == self.user or msg.webhook_id is not None:
+            return  # our mirrors and foreign webhooks are not Discord-native
+
+        new_content = await clean_discord_content(
+            msg.content or "", msg, stoat_bot._http_session
         )
-        await edit_stoat_message(stoat_ch_id, stoat_msg_id, struck, self._stoat_bot)
+        for att in msg.attachments:
+            new_content += f" {att.url}"
+
+        # Discord fires MESSAGE_UPDATE when link embeds load with the content
+        # unchanged – nothing to mirror in that case
+        stoat_ch_id = DISCORD_TO_STOAT[payload.channel_id]
+        orig = await fetch_stoat_message(stoat_ch_id, stoat_msg_id, stoat_bot)
+        old_content = (orig.content if orig else "") or ""
+        if old_content == new_content:
+            return
+
+        combined = (
+            f"{_strike_through(old_content)}\n{new_content}"
+            if old_content.strip()
+            else new_content
+        )
+        await edit_stoat_message(stoat_ch_id, stoat_msg_id, combined, stoat_bot)
 
     # ── Reactions: Discord → Stoat ─────────────────────────────────────────────
 

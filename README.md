@@ -183,6 +183,7 @@ The Discord channel ID must be one of the pairs in your `.env`. Run it **before*
 ## Notes
 - The bridge creates a webhook named `Stoat Bridge` in your Discord channel automatically. If one already exists from a previous run it will be reused.
 - Messages originating from the bridge webhook are ignored to prevent forwarding loops.
+- **Edit behaviour (Discord → Stoat):** when a Discord message is edited, its Stoat mirror is edited in place — the previous version struck through (`~~like this~~`), the new version below it. Edit events with unchanged content (Discord fires them when link embeds load) are ignored. Like replies, this only covers the last 500 bridged messages. Edits on Stoat are **not** mirrored to Discord.
 - **Deletion behaviour (Stoat is the Discord archive):**
   - A message deleted on **Discord** stays on Stoat, struck through (`~~like this~~`), so the archive keeps the content while showing it was deleted.
   - A **Stoat-native** message deleted on Stoat is also deleted on Discord.
