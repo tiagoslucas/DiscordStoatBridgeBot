@@ -574,6 +574,38 @@ async def fetch_stoat_message(
     return None
 
 
+def _stoat_msg_from_raw(raw: dict, user: dict) -> SimpleNamespace:
+    """Wrap a REST message dict in the shape _bridge_stoat_message expects."""
+    avatar = user.get("avatar")
+    return SimpleNamespace(
+        id=str(raw["_id"]),
+        channel=SimpleNamespace(id=raw.get("channel")),
+        content=raw.get("content") or "",
+        author=SimpleNamespace(
+            display_name=user.get("display_name") or user.get("username") or "unknown",
+            avatar=SimpleNamespace(_id=avatar.get("_id"), tag=avatar.get("tag")) if avatar else None,
+        ),
+        attachments=[SimpleNamespace(**a) for a in raw.get("attachments") or []],
+        replies=raw.get("replies") or [],
+    )
+
+
+async def _resolve_stoat_user(
+    session: aiohttp.ClientSession, cache: dict, user_id: str
+) -> dict:
+    """Stoat user info by id, cached per catch-up run."""
+    if user_id not in cache:
+        try:
+            async with session.get(
+                f"{REVOLT_API_URL}/users/{user_id}",
+                headers={"x-bot-token": STOAT_BOT_TOKEN},
+            ) as resp:
+                cache[user_id] = (await resp.json()) if resp.status == 200 else {}
+        except Exception:
+            cache[user_id] = {}
+    return cache[user_id]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  STOAT MESSAGE EDIT HELPER
 # ──────────────────────────────────────────────────────────────────────────────
@@ -963,6 +995,8 @@ class StoatBot(stoat.Client):
         self._healthpulse: bool = False
         self._health_msg_id: str | None = None
         self._planned_restart: bool = False  # set by _do_restart(); read by the supervisor in main()
+        self._s2d_catchup_running = False    # Stoat→Discord catch-up (see _run_s2d_catchup)
+        self._recently_live: OrderedDict[str, None] = OrderedDict()  # stoat msg ids forwarded live
 
     async def on_ready(self, event, /):
         if self._http_session and not self._http_session.closed:
@@ -986,6 +1020,7 @@ class StoatBot(stoat.Client):
         if self._discord_bot is not None and not self._planned_restart:
             self._discord_bot._maybe_start_catchup()
             self._discord_bot._maybe_sync_emojis()
+            self._start_s2d_catchup()
 
     async def _run_health_check(self) -> None:
         """
@@ -1119,6 +1154,19 @@ class StoatBot(stoat.Client):
             _mark_notified("stoat", uid)
             asyncio.create_task(self._try_send_stoat_dm(uid))
 
+        # Remember live-forwarded ids so the Stoat→Discord catch-up can never
+        # re-send a message that arrived while it was walking the history.
+        self._remember_live(str(msg.id))
+        await self._bridge_stoat_message(msg)
+
+    def _remember_live(self, stoat_msg_id: str) -> None:
+        self._recently_live[stoat_msg_id] = None
+        while len(self._recently_live) > MSG_CACHE_SIZE:
+            self._recently_live.popitem(last=False)
+
+    async def _bridge_stoat_message(self, msg) -> None:
+        """Forward one Stoat-native message to its Discord mirror (live or catch-up)."""
+        stoat_id   = msg.channel.id
         discord_id = STOAT_TO_DISCORD[stoat_id]
         webhook    = discord_webhooks.get(discord_id)
         if webhook is None:
@@ -1309,6 +1357,124 @@ class StoatBot(stoat.Client):
                 existing = _find_guild_emoji(guild, name)
                 d_id = existing.id if existing else None
         return discord.PartialEmoji(name=name, id=d_id) if d_id else None
+
+    # ── Catch-up: Stoat → Discord ──────────────────────────────────────────────
+
+    def _start_s2d_catchup(self) -> None:
+        """After (re)connecting, forward Stoat-native messages missed while down."""
+        if self._s2d_catchup_running:
+            return
+        self._s2d_catchup_running = True
+        asyncio.create_task(self._run_s2d_catchup())
+
+    async def _run_s2d_catchup(self) -> None:
+        """Forward Stoat-native messages sent while the Stoat session was down.
+
+        They are APPENDED as new webhook messages – Discord history is never
+        rewritten. Fail-safe like the Discord→Stoat catch-up: each channel's
+        newest mirrors on Discord are fingerprinted, the Stoat history is
+        walked backwards until a fingerprint matches, and everything newer is
+        forwarded; with no overlap found the channel is skipped rather than
+        risk duplicate messages on Discord.
+        """
+        try:
+            dbot   = self._discord_bot
+            session = self._http_session
+            if dbot is None or session is None:
+                return
+            headers  = {"x-bot-token": STOAT_BOT_TOKEN}
+            me_id    = _extract_id(self.me)
+            our_whs  = {wh.id for wh in discord_webhooks.values()}
+
+            for stoat_id, discord_id in STOAT_TO_DISCORD.items():
+                channel = dbot.get_channel(discord_id)
+                webhook = discord_webhooks.get(discord_id)
+                if channel is None or webhook is None:
+                    continue
+
+                # 1. fingerprints of our newest mirrors on Discord
+                mirror_fps: set[tuple[str, str, int]] = set()
+                async for m in channel.history(limit=200):
+                    if m.webhook_id in our_whs:
+                        mirror_fps.add(
+                            (m.author.name, dbot._s2d_fp(m.content or ""), len(m.attachments))
+                        )
+                if not mirror_fps:
+                    # nothing mirrored yet – no baseline to match against
+                    logger.debug(f"S2D catch-up: no mirrors in Discord channel {discord_id} – skipped")
+                    continue
+
+                # 2. walk Stoat history backwards from the newest message; live
+                #    messages arriving now have newer ids and stay outside the
+                #    walk (plus _recently_live guards the connect race)
+                user_cache: dict[str, dict] = {}
+                missed: list[tuple[dict, dict]] = []
+                before: str | None = None
+                matched = False
+                walked  = 0
+                while walked < 500:
+                    url = (
+                        f"{REVOLT_API_URL}/channels/{stoat_id}/messages"
+                        f"?limit=100&sort=Latest&include_users=false"
+                    )
+                    if before:
+                        url += "&before=" + before
+                    try:
+                        async with session.get(url, headers=headers) as resp:
+                            if resp.status != 200:
+                                logger.warning(
+                                    f"S2D catch-up: fetch HTTP {resp.status} in {stoat_id}"
+                                )
+                                break
+                            batch = await resp.json()
+                    except Exception as exc:
+                        logger.warning(f"S2D catch-up: fetch error in {stoat_id}: {exc}")
+                        break
+                    if not isinstance(batch, list) or not batch:
+                        break
+
+                    for raw in batch:
+                        walked += 1
+                        if raw.get("author") == me_id:
+                            continue  # our own Discord→Stoat mirror
+                        if str(raw["_id"]) in self._recently_live:
+                            matched = True  # the live path took over from here
+                            break
+                        user = await _resolve_stoat_user(session, user_cache, raw.get("author"))
+                        name = (
+                            user.get("display_name") or user.get("username") or "unknown"
+                        )[:80]
+                        content = await clean_stoat_content(
+                            raw.get("content") or "", session, STOAT_BOT_TOKEN
+                        )
+                        fp = (name, dbot._s2d_fp(content[:2000]), len(raw.get("attachments") or []))
+                        if fp in mirror_fps:
+                            matched = True
+                            break
+                        missed.append((raw, user))
+                    if matched or len(batch) < 100:
+                        break
+                    before = str(batch[-1]["_id"])
+
+                if not matched:
+                    if missed:
+                        # fail safe: a miss is better than duplicate messages
+                        logger.warning(
+                            f"S2D catch-up: no overlap found in Stoat channel {stoat_id} "
+                            f"within 500 messages – nothing forwarded"
+                        )
+                    continue
+
+                # 3. forward what was missed, oldest first
+                for raw, user in reversed(missed):
+                    await self._bridge_stoat_message(_stoat_msg_from_raw(raw, user))
+                if missed:
+                    logger.info(
+                        f"S2D catch-up: forwarded {len(missed)} Stoat message(s) "
+                        f"to Discord channel {discord_id}"
+                    )
+        finally:
+            self._s2d_catchup_running = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1567,6 +1733,16 @@ class DiscordBot(commands.Bot):
             t.split("?", 1)[0] if t.startswith("http") else t
             for t in content.split()
         )
+
+    @staticmethod
+    def _s2d_fp(content: str) -> str:
+        """Stoat→Discord catch-up fingerprint: _fp_normalize plus custom
+        emojis collapsed to :name: — Discord mirrors carry <:name:id> while
+        the Stoat originals carry :ULID:, and both must compare equal without
+        depending on emoji mirroring having succeeded."""
+        content = DiscordBot._fp_normalize(content)
+        content = re.sub(r"<a?:([A-Za-z0-9_]+):\d+>", r":\1:", content)
+        return content
 
     async def _fingerprint(self, message: discord.Message, session=None) -> tuple[str, str]:
         """Stable (name, content) fingerprint of a Discord message as archived."""
