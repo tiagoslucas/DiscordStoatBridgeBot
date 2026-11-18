@@ -7,7 +7,8 @@ Usage:
 
 Reads the same .env as bridge.py and uses the same formatting (nicknames via
 masquerade, mention resolution, custom emojis mirrored to the Stoat server,
-attachment URLs appended as text).
+attachment URLs appended as text). Reactions are copied too, added by the bot
+one per emoji – same semantics as live reaction bridging.
 
 --resume continues after the newest Discord message the last run processed
 (state in .backfill_state/), so an interrupted run or a gap pass picks up
@@ -74,13 +75,18 @@ async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Clien
                 else str(msg.author.default_avatar.url)
             )
             # shortcut: replies are not preserved as replies, they land as plain text
-            await ch.send(
+            sent = await ch.send(
                 masquerade=stoat.Masquerade(
                     name=msg.author.display_name[:32],
                     avatar=avatar_url,
                 ),
                 content=content[:2000],
             )
+            sent_id = bridge._extract_id(sent)
+            if sent_id and msg.reactions:
+                await bridge.copy_discord_reactions(
+                    msg.reactions, session, stoat_channel_id, sent_id
+                )
             count += 1
             if count % 100 == 0:
                 logger.info(f"{count} messages backfilled…")

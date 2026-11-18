@@ -844,6 +844,28 @@ async def _stoat_fetch_reactions(
     return {}
 
 
+async def copy_discord_reactions(
+    reactions, session: aiohttp.ClientSession, stoat_channel_id: str, stoat_msg_id: str
+) -> None:
+    """Mirror a Discord message's reactions onto its Stoat mirror (backfill helper).
+
+    One reaction per emoji, added as the bot – same semantics as live bridging.
+    """
+    for reaction in reactions:
+        emoji = reaction.emoji
+        if getattr(emoji, "id", None):
+            stoat_emoji = await ensure_stoat_emoji(
+                emoji.name, emoji.id, emoji.animated, session
+            )
+            if stoat_emoji is None:
+                continue  # custom emoji that could not be mirrored
+            emoji_str = stoat_emoji
+        else:
+            emoji_str = str(emoji)
+        await _stoat_set_reaction(session, stoat_channel_id, stoat_msg_id, emoji_str, add=True)
+        await asyncio.sleep(0.1)  # stay under the bot rate limit on long backfills
+
+
 _RE_STOAT_EMOJI_ID = re.compile(r"[A-Z0-9]{26}")
 
 

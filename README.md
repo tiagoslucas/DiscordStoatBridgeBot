@@ -150,7 +150,7 @@ Same command – the bridge will find the existing `.env`, skip the setup wizard
 
 ### Backfill existing history
 
-`backfill.py` copies a Discord channel's **entire history** (oldest first) to its Stoat mirror, using the same formatting as live bridging (nicknames via masquerade, mention resolution, custom emojis mirrored to the Stoat server, attachments as links).
+`backfill.py` copies a Discord channel's **entire history** (oldest first) to its Stoat mirror, using the same formatting as live bridging (nicknames via masquerade, mention resolution, custom emojis mirrored to the Stoat server, attachments as links). Reactions are copied too — added by the bot, one per emoji.
 
 ```bash
 python backfill.py <discord_channel_id>
