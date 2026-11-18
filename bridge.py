@@ -743,7 +743,12 @@ async def ensure_stoat_emoji(
                 return None
             form = aiohttp.FormData()
             form.add_field("file", fetched[0], filename=f"{name}.{ext}")
-            async with session.post(f"{REVOLT_CDN_URL}/emojis", data=form) as resp:
+            # the CDN upload endpoint requires the bot token (401 without it)
+            async with session.post(
+                f"{REVOLT_CDN_URL}/emojis",
+                headers={"x-bot-token": STOAT_BOT_TOKEN},
+                data=form,
+            ) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
                     logger.warning(f"Emoji: Stoat upload of :{name}: failed: HTTP {resp.status} – {body[:200]}")
