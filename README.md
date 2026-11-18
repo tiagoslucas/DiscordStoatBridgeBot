@@ -143,6 +143,8 @@ The Discord channel ID must be one of the pairs in your `.env`. Run it **before*
 
 `--resume` continues after the newest message the last run processed (state in `.backfill_state/`), so an interrupted run or a gap pass picks up exactly where it stopped.
 
+`clean_stoat.py <discord_channel_id>` deletes every bot-authored message from a Stoat mirror channel (other users' messages are untouched) — the maintenance companion to backfill: clean + backfill = a fresh mirror with no duplicates. The bot's own user is resolved from the token at runtime; nothing is hardcoded.
+
 ---
 
 ### Configuration reference
