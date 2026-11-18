@@ -702,6 +702,11 @@ async def _get_stoat_server_id(session: aiohttp.ClientSession) -> str | None:
     return _stoat_server_id
 
 
+def _stoat_emoji_name(name: str) -> str:
+    """Stoat emoji names must be lowercase [a-z0-9_] (create rejects e.g. 'LUL')."""
+    return re.sub(r"[^a-z0-9_]", "_", name.lower())[:32] or "emoji"
+
+
 async def ensure_stoat_emoji(
     name: str, discord_emoji_id: int, animated: bool, session: aiohttp.ClientSession
 ) -> str | None:
@@ -723,13 +728,14 @@ async def ensure_stoat_emoji(
             # Reuse an existing Stoat emoji with the same name. The map file
             # lives next to .env, which is RAM-only on overlayfs hosts and
             # wiped on reboot – name matching re-links instead of duplicating.
+            stoat_name = _stoat_emoji_name(name)
             async with session.get(
                 f"{REVOLT_API_URL}/servers/{server_id}/emojis",
                 headers={"x-bot-token": STOAT_BOT_TOKEN},
             ) as resp:
                 if resp.status == 200:
                     for e in await resp.json():
-                        if e.get("name") == name:
+                        if e.get("name") == stoat_name:
                             stoat_id = _extract_id(e)
                             if stoat_id:
                                 _link_emoji(key, stoat_id)
@@ -759,7 +765,7 @@ async def ensure_stoat_emoji(
             async with session.put(
                 f"{REVOLT_API_URL}/custom/emoji/{attachment_id}",
                 headers={"x-bot-token": STOAT_BOT_TOKEN},
-                json={"name": name, "parent": {"type": "Server", "id": server_id}},
+                json={"name": stoat_name, "parent": {"type": "Server", "id": server_id}},
             ) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
