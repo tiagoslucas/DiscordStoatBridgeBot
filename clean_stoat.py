@@ -41,6 +41,11 @@ async def clean_channel(
         if before:
             url += "&before=" + before
         async with h.get(url, headers=headers) as r:
+            if r.status == 429:
+                # rate-limited mid-pagination: back off and re-fetch the page,
+                # a plain break would silently leave older messages uncleaned
+                await asyncio.sleep((await r.json()).get("retry_after", 9000) / 1000 + 0.5)
+                continue
             if r.status != 200:
                 logger.error(f"{stoat_channel_id}: fetch HTTP {r.status}")
                 break
