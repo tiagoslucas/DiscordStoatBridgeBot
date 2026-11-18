@@ -29,7 +29,9 @@ The bridge caches the last **500** message ID pairs in memory (configurable). Re
 | Stoat → Discord | `<@ULID>` → `@DisplayName` |
 
 ### Custom emojis
-Custom emojis are mirrored between the two servers on first use, so they render natively on both sides (in messages **and** reactions). Discord `<:name:id>` is uploaded to the Stoat server; Stoat `:ULID:` is created in the Discord guild. The id mapping is persisted to `emoji_map.json` next to `.env`, and emojis are also re-linked by name on startup — losing the map file never duplicates emojis.
+Custom emojis are mirrored between the two servers, so they render natively on both sides (in messages **and** reactions). Discord `<:name:id>` is uploaded to the Stoat server; Stoat `:ULID:` is created in the Discord guild. **All** custom emojis of the bridged Discord guilds are bulk-mirrored to Stoat when the bridge starts, and a newly created Discord emoji is mirrored the moment it appears; Stoat → Discord mirroring happens on first use.
+
+The id mapping is **derived from the two servers by emoji name** — there is no state file. This is deliberate: on hosts with RAM-only storage (overlayfs) every reboot wipes local files, and the servers themselves are the source of truth, so a reboot simply re-links the mapping. A Discord emoji named `LUL` corresponds to the Stoat emoji `lul` (Stoat requires lowercase names).
 
 If the bot lacks the upload permissions (see below), emojis fall back to `:name:` text and custom-emoji reactions are skipped.
 

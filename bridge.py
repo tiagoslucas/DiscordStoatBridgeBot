@@ -640,47 +640,29 @@ async def resolve_revolt_emoji(emoji_id: str, session: aiohttp.ClientSession, to
 # ──────────────────────────────────────────────────────────────────────────────
 #  EMOJI SYNC  (custom emojis mirrored between the Discord guild and the Stoat
 #  server, so they render natively in messages and reactions on both sides)
+#
+#  The id map is derived from the two servers by NAME – there is no state file.
+#  Storage on overlayfs hosts is RAM-only and wiped on every reboot; the
+#  servers themselves are the source of truth, so a lost map just re-links.
 # ──────────────────────────────────────────────────────────────────────────────
-
-EMOJI_MAP_FILE = ENV_FILE.parent / "emoji_map.json"
 
 _emoji_d2s: dict[str, str] = {}   # discord emoji id → stoat emoji id
 _emoji_s2d: dict[str, str] = {}   # stoat emoji id → discord emoji id (as str)
-_emoji_map_loaded = False
 _emoji_lock_d2s = asyncio.Lock()  # serialize creation: two uses of a brand-new
 _emoji_lock_s2d = asyncio.Lock()  # emoji must not upload it twice
 _stoat_server_id: str | None = None
 
 
-def _load_emoji_map() -> None:
-    global _emoji_map_loaded
-    if _emoji_map_loaded:
-        return
-    _emoji_map_loaded = True
-    if not EMOJI_MAP_FILE.exists():
-        return
-    try:
-        data = json.loads(EMOJI_MAP_FILE.read_text(encoding="utf-8"))
-        _emoji_d2s.update({str(k): str(v) for k, v in (data.get("discord_to_stoat") or {}).items()})
-        _emoji_s2d.update({str(k): str(v) for k, v in (data.get("stoat_to_discord") or {}).items()})
-    except Exception as exc:
-        logger.warning(f"Could not load {EMOJI_MAP_FILE}: {exc}")
-
-
-def _save_emoji_map() -> None:
-    try:
-        EMOJI_MAP_FILE.write_text(
-            json.dumps({"discord_to_stoat": _emoji_d2s, "stoat_to_discord": _emoji_s2d}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.warning(f"Could not save {EMOJI_MAP_FILE}: {exc}")
-
-
 def _link_emoji(discord_id: int | str, stoat_id: str) -> None:
     _emoji_d2s[str(discord_id)] = stoat_id
     _emoji_s2d[stoat_id] = str(discord_id)
-    _save_emoji_map()
+
+
+def _find_guild_emoji(guild: "discord.Guild | None", name: str):
+    """Case-insensitive name match: Discord 'LUL' must re-link to Stoat 'lul'."""
+    if guild is None:
+        return None
+    return discord.utils.find(lambda e: e.name.lower() == name.lower(), guild.emojis)
 
 
 async def _get_stoat_server_id(session: aiohttp.ClientSession) -> str | None:
@@ -711,7 +693,6 @@ async def ensure_stoat_emoji(
     name: str, discord_emoji_id: int, animated: bool, session: aiohttp.ClientSession
 ) -> str | None:
     """Discord custom emoji → Stoat emoji id, uploading it to the Stoat server on first use."""
-    _load_emoji_map()
     key = str(discord_emoji_id)
     if key in _emoji_d2s:
         return _emoji_d2s[key]
@@ -786,7 +767,6 @@ async def ensure_discord_emoji(
     stoat_emoji_id: str, session: aiohttp.ClientSession, guild: "discord.Guild | None"
 ) -> int | None:
     """Stoat custom emoji → Discord emoji id, creating it in the bridged guild on first use."""
-    _load_emoji_map()
     if stoat_emoji_id in _emoji_s2d:
         return int(_emoji_s2d[stoat_emoji_id])
     if guild is None:
@@ -797,7 +777,7 @@ async def ensure_discord_emoji(
         try:
             name = await resolve_revolt_emoji(stoat_emoji_id, session, STOAT_BOT_TOKEN)
             # Reuse by name first – same reboot-resilience as the Stoat side.
-            existing = discord.utils.get(guild.emojis, name=name)
+            existing = _find_guild_emoji(guild, name)
             if existing is None:
                 fetched = await fetch_bytes(session, f"{REVOLT_CDN_URL}/emojis/{stoat_emoji_id}")
                 if fetched is None:
@@ -1005,6 +985,7 @@ class StoatBot(stoat.Client):
         # Stoat session was down.
         if self._discord_bot is not None and not self._planned_restart:
             self._discord_bot._maybe_start_catchup()
+            self._discord_bot._maybe_sync_emojis()
 
     async def _run_health_check(self) -> None:
         """
@@ -1317,7 +1298,6 @@ class StoatBot(stoat.Client):
         if not _RE_STOAT_EMOJI_ID.fullmatch(stoat_emoji):
             return stoat_emoji  # unicode emoji, passes straight through
         name = await resolve_revolt_emoji(stoat_emoji, self._http_session, STOAT_BOT_TOKEN)
-        _load_emoji_map()
         d_id: int | None = None
         if create:
             d_id = await ensure_discord_emoji(stoat_emoji, self._http_session, guild)
@@ -1326,7 +1306,7 @@ class StoatBot(stoat.Client):
             if mapped:
                 d_id = int(mapped)
             else:
-                existing = discord.utils.get(guild.emojis, name=name) if guild else None
+                existing = _find_guild_emoji(guild, name)
                 d_id = existing.id if existing else None
         return discord.PartialEmoji(name=name, id=d_id) if d_id else None
 
@@ -1355,6 +1335,59 @@ class DiscordBot(commands.Bot):
         self._pending: list[discord.Message] = []
         self._catchup_highwater: dict[int, int] = {}
 
+        self._emoji_sync_done = False  # bulk emoji mirror runs once per boot
+
+    def _bridged_guilds(self) -> set[discord.Guild]:
+        """The Discord guilds hosting the bridged channels."""
+        return {
+            c.guild
+            for c in (self.get_channel(i) for i in DISCORD_CHANNEL_IDS)
+            if isinstance(c, discord.TextChannel)
+        }
+
+    def _maybe_sync_emojis(self) -> None:
+        """Bulk-mirror all guild emojis once both sides are connected."""
+        if self._emoji_sync_done:
+            return
+        stoat_bot = self._stoat_bot
+        if stoat_bot is None or stoat_bot._http_session is None or not self.is_ready():
+            return
+        self._emoji_sync_done = True
+        asyncio.create_task(self._sync_all_emojis(stoat_bot._http_session))
+
+    async def _sync_all_emojis(self, session: aiohttp.ClientSession) -> None:
+        """Mirror every custom emoji of the bridged guilds to the Stoat server.
+
+        Already-mirrored emojis re-link by name (no state file – see the emoji
+        sync section); only genuinely new ones are uploaded.
+        """
+        total = ok = 0
+        for guild in self._bridged_guilds():
+            for emoji in guild.emojis:
+                total += 1
+                if await ensure_stoat_emoji(emoji.name, emoji.id, emoji.animated, session):
+                    ok += 1
+                else:
+                    logger.warning(
+                        f"Emoji: bulk sync could not mirror :{emoji.name}: – it will retry on next use or reboot"
+                    )
+                await asyncio.sleep(0.5)  # stay clear of the bot rate limit
+        logger.info(f"Emoji: bulk sync done – {ok}/{total} guild emoji(s) available on Stoat")
+
+    async def on_guild_emojis_update(self, guild, before, after):
+        """New custom emojis on Discord are mirrored to Stoat right away."""
+        stoat_bot = self._stoat_bot
+        if stoat_bot is None or stoat_bot._http_session is None:
+            return
+        if guild not in self._bridged_guilds():
+            return
+        for emoji in after:
+            if emoji in before:
+                continue  # unchanged or deleted
+            await ensure_stoat_emoji(
+                emoji.name, emoji.id, emoji.animated, stoat_bot._http_session
+            )
+
     async def setup_hook(self):
         self.loop.create_task(self._setup_webhooks())
 
@@ -1379,6 +1412,7 @@ class DiscordBot(commands.Bot):
         logger.info(f"Discord: connected as {self.user}")
         logger.info(f"Discord: bridging {PAIR_COUNT} channel pair(s)")
         self._maybe_start_catchup()
+        self._maybe_sync_emojis()
 
     # ── Send a DM on Discord ──────────────────────────────────────────────────
 
@@ -1742,12 +1776,7 @@ class DiscordBot(commands.Bot):
             logger.warning("Discord -> Stoat: channel create ignored – Stoat not ready yet")
             return
         # Only mirror channels in the guild we are bridging.
-        bridged_guilds = {
-            c.guild.id
-            for c in (self.get_channel(i) for i in DISCORD_CHANNEL_IDS)
-            if isinstance(c, discord.TextChannel)
-        }
-        if channel.guild.id not in bridged_guilds:
+        if channel.guild not in self._bridged_guilds():
             return
 
         session = stoat_bot._http_session
