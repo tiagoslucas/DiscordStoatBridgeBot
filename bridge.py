@@ -619,7 +619,8 @@ def _strike_through(content: str) -> str:
 
 
 async def edit_stoat_message(channel_id: str, message_id: str, content: str, stoat_client: "StoatBot") -> bool:
-    """Edit a bot-sent message on Stoat via REST (used to strike through deleted Discord messages)."""    session = stoat_client._http_session
+    """Edit a bot-sent message on Stoat via REST (used to strike through deleted Discord messages)."""
+    session = stoat_client._http_session
     if session is None:
         logger.warning("edit_stoat_message: HTTP session not ready")
         return False
