@@ -110,8 +110,15 @@ class _BackfillStoat(stoat.Client):
         self._dc = discord_client
         self._discord_channel_id = discord_channel_id
         self._after_id = after_id
+        self._started = False
 
     async def on_ready(self, event, /):
+        # A Stoat gateway reconnect re-fires on_ready mid-run; without this
+        # guard a second backfill loop starts from the beginning and
+        # duplicates everything already copied.
+        if self._started:
+            return
+        self._started = True
         try:
             await self._dc.wait_until_ready()
             await run_backfill(self, self._dc, self._discord_channel_id, self._after_id)
