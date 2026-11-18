@@ -33,6 +33,8 @@ Custom emojis are mirrored between the two servers, so they render natively on b
 
 The id mapping is **derived from the two servers by emoji name** — there is no state file. This is deliberate: on hosts with RAM-only storage (overlayfs) every reboot wipes local files, and the servers themselves are the source of truth, so a reboot simply re-links the mapping. A Discord emoji named `LUL` corresponds to the Stoat emoji `lul` (Stoat requires lowercase names).
 
+Stoat caps a server at **100 custom emojis**. The bridge keeps its own emojis at *the 100 most recently used*: messages and reactions on both platforms count as uses, the recency order is rebuilt at startup from the recent mirror history (no state file), and when a slot is needed for a used emoji the bridge's least-recently-used emoji is pruned to make room. Emojis uploaded by users on Stoat are **never** pruned (only bot-created ones are eligible); if the remaining slots are all user-uploaded, new mirrors fall back to text. The startup bulk sync never evicts for unused emojis – it fills free slots and stops at the cap.
+
 If the bot lacks the upload permissions (see below), emojis fall back to `:name:` text and custom-emoji reactions are skipped.
 
 ### Reactions

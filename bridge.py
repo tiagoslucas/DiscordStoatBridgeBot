@@ -691,6 +691,89 @@ _emoji_lock_d2s = asyncio.Lock()  # serialize creation: two uses of a brand-new
 _emoji_lock_s2d = asyncio.Lock()  # emoji must not upload it twice
 _stoat_server_id: str | None = None
 
+# Stoat caps a server at 100 custom emojis. The bridge keeps its own emojis
+# at "the 100 most recently used": uses (messages + reactions, both platforms)
+# are tracked in _emoji_use, rebuilt at boot from the recent mirror history;
+# when a slot is needed, the bridge's least-recently-used emoji is pruned.
+# Emojis uploaded by users are never pruned (creator_id check).
+_emoji_use: OrderedDict[str, None] = OrderedDict()  # stoat emoji id, oldest use first
+_emoji_server_full = False
+_stoat_bot_id_cache: str | None = None
+
+
+def _note_emoji_use(stoat_emoji_id: str) -> None:
+    _emoji_use[stoat_emoji_id] = None
+    _emoji_use.move_to_end(stoat_emoji_id)
+
+
+async def _get_stoat_bot_id(session: aiohttp.ClientSession) -> str | None:
+    global _stoat_bot_id_cache
+    if _stoat_bot_id_cache:
+        return _stoat_bot_id_cache
+    try:
+        async with session.get(
+            f"{REVOLT_API_URL}/users/@me", headers={"x-bot-token": STOAT_BOT_TOKEN}
+        ) as resp:
+            if resp.status == 200:
+                _stoat_bot_id_cache = _extract_id(await resp.json())
+    except Exception as exc:
+        logger.debug(f"Could not resolve the Stoat bot id: {exc}")
+    return _stoat_bot_id_cache
+
+
+def _emoji_prune_key(emoji: dict, rank: dict) -> tuple:
+    """Sort key for prune candidates: never-used emojis first, then least recently used."""
+    r = rank.get(_extract_id(emoji))
+    return (0, 0) if r is None else (1, r)
+
+
+async def _prune_emoji_slot(session: aiohttp.ClientSession, server_id: str) -> bool:
+    """Free one Stoat emoji slot by deleting the bridge's own least-recently-used
+    emoji. User-uploaded emojis are never touched."""
+    global _emoji_server_full
+    bot_id = await _get_stoat_bot_id(session)
+    if bot_id is None:
+        return False
+    try:
+        async with session.get(
+            f"{REVOLT_API_URL}/servers/{server_id}/emojis",
+            headers={"x-bot-token": STOAT_BOT_TOKEN},
+        ) as resp:
+            if resp.status != 200:
+                return False
+            emojis = await resp.json()
+    except Exception as exc:
+        logger.warning(f"Emoji: prune could not list server emojis: {exc}")
+        return False
+
+    rank = {eid: i for i, eid in enumerate(_emoji_use)}  # least recent use = 0
+    ours = sorted(
+        (e for e in emojis if e.get("creator_id") == bot_id),
+        key=lambda e: _emoji_prune_key(e, rank),
+    )
+    for victim in ours:
+        vid = _extract_id(victim)
+        try:
+            async with session.delete(
+                f"{REVOLT_API_URL}/custom/emoji/{vid}",
+                headers={"x-bot-token": STOAT_BOT_TOKEN},
+            ) as resp:
+                if resp.status in (200, 204):
+                    did = _emoji_s2d.pop(vid, None)  # future use re-creates it
+                    if did:
+                        _emoji_d2s.pop(did, None)
+                    _emoji_use.pop(vid, None)
+                    _emoji_server_full = False
+                    logger.info(
+                        f"Emoji: pruned :{victim.get('name')}: – least recently used"
+                    )
+                    return True
+                body = await resp.text()
+                logger.warning(f"Emoji: prune delete HTTP {resp.status}: {body[:120]}")
+        except Exception as exc:
+            logger.warning(f"Emoji: prune delete error: {exc}")
+    return False
+
 
 def _link_emoji(discord_id: int | str, stoat_id: str) -> None:
     _emoji_d2s[str(discord_id)] = stoat_id
@@ -729,16 +812,27 @@ def _stoat_emoji_name(name: str) -> str:
 
 
 async def ensure_stoat_emoji(
-    name: str, discord_emoji_id: int, animated: bool, session: aiohttp.ClientSession
+    name: str,
+    discord_emoji_id: int,
+    animated: bool,
+    session: aiohttp.ClientSession,
+    *,
+    prune: bool = True,
 ) -> str | None:
-    """Discord custom emoji → Stoat emoji id, uploading it to the Stoat server on first use."""
+    """Discord custom emoji → Stoat emoji id, uploading it to the Stoat server on
+    first use. With prune=True (a real use: message or reaction), a full server
+    evicts the bridge's least-recently-used emoji to make room; bulk syncs pass
+    prune=False and simply skip."""
+    global _emoji_server_full
     key = str(discord_emoji_id)
     if key in _emoji_d2s:
+        _note_emoji_use(_emoji_d2s[key])
         return _emoji_d2s[key]
     if session is None:
         return None
     async with _emoji_lock_d2s:
         if key in _emoji_d2s:  # created while we waited on the lock
+            _note_emoji_use(_emoji_d2s[key])
             return _emoji_d2s[key]
         try:
             server_id = await _get_stoat_server_id(session)
@@ -759,6 +853,7 @@ async def ensure_stoat_emoji(
                             stoat_id = _extract_id(e)
                             if stoat_id:
                                 _link_emoji(key, stoat_id)
+                                _note_emoji_use(stoat_id)
                                 return stoat_id
 
             ext = "gif" if animated else "png"
@@ -782,19 +877,31 @@ async def ensure_stoat_emoji(
                 attachment_id = (await resp.json()).get("id")
             if not attachment_id:
                 return None
-            async with session.put(
-                f"{REVOLT_API_URL}/custom/emoji/{attachment_id}",
-                headers={"x-bot-token": STOAT_BOT_TOKEN},
-                json={"name": stoat_name, "parent": {"type": "Server", "id": server_id}},
-            ) as resp:
-                if resp.status not in (200, 201):
+
+            stoat_id = None
+            for attempt in range(2):
+                async with session.put(
+                    f"{REVOLT_API_URL}/custom/emoji/{attachment_id}",
+                    headers={"x-bot-token": STOAT_BOT_TOKEN},
+                    json={"name": stoat_name, "parent": {"type": "Server", "id": server_id}},
+                ) as resp:
+                    if resp.status in (200, 201):
+                        stoat_id = _extract_id(await resp.json())
+                        break
                     body = await resp.text()
+                    if "TooManyEmoji" in body and prune and attempt == 0:
+                        logger.info("Emoji: Stoat server emoji slots full – pruning the least recently used")
+                        if await _prune_emoji_slot(session, server_id):
+                            continue
+                    if "TooManyEmoji" in body:
+                        _emoji_server_full = True
                     logger.warning(f"Emoji: Stoat create of :{name}: failed: HTTP {resp.status} – {body[:200]}")
                     return None
-                stoat_id = _extract_id(await resp.json())
             if not stoat_id:
                 return None
+            _emoji_server_full = False
             _link_emoji(key, stoat_id)
+            _note_emoji_use(stoat_id)
             logger.info(f"Emoji: mirrored Discord :{name}: to Stoat as {stoat_id}")
             return stoat_id
         except Exception as exc:
@@ -975,6 +1082,8 @@ async def clean_stoat_content(
 
     matches = list(_RE_REVOLT_CUSTOM_EMO.finditer(result))
     if matches:
+        for m in matches:
+            _note_emoji_use(m.group(1))  # a Stoat-side use counts toward recency
         names = await asyncio.gather(
             *[resolve_revolt_emoji(m.group(1), session, token) for m in matches]
         )
@@ -1004,6 +1113,7 @@ class StoatBot(stoat.Client):
         self._planned_restart: bool = False  # set by _do_restart(); read by the supervisor in main()
         self._s2d_catchup_running = False    # Stoat→Discord catch-up (see _run_s2d_catchup)
         self._recently_live: OrderedDict[str, None] = OrderedDict()  # stoat msg ids forwarded live
+        self._emoji_use_built = False        # usage recency rebuilt once per process
 
     async def on_ready(self, event, /):
         if self._http_session and not self._http_session.closed:
@@ -1028,6 +1138,54 @@ class StoatBot(stoat.Client):
             self._discord_bot._maybe_start_catchup()
             self._discord_bot._maybe_sync_emojis()
             self._start_s2d_catchup()
+            self._build_emoji_usage()
+
+    def _build_emoji_usage(self) -> None:
+        """Rebuild emoji-use recency once per process (stateless – derived
+        from the recent mirror history, see _scan_emoji_usage)."""
+        if self._emoji_use_built:
+            return
+        self._emoji_use_built = True
+        asyncio.create_task(self._scan_emoji_usage())
+
+    async def _scan_emoji_usage(self) -> None:
+        """Rebuild _emoji_use from the newest 200 messages of each mirror:
+        emojis in message content and in reaction tables both count as uses,
+        oldest→newest so the recency order ends up correct."""
+        session = self._http_session
+        if session is None:
+            return
+        headers = {"x-bot-token": STOAT_BOT_TOKEN}
+        seen = 0
+        for stoat_id in STOAT_CHANNEL_IDS:
+            before = None
+            for _page in range(2):
+                url = (
+                    f"{REVOLT_API_URL}/channels/{stoat_id}/messages"
+                    f"?limit=100&sort=Latest&include_users=false"
+                )
+                if before:
+                    url += "&before=" + before
+                try:
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status != 200:
+                            break
+                        batch = await resp.json()
+                except Exception:
+                    break
+                if not isinstance(batch, list) or not batch:
+                    break
+                for raw in reversed(batch):
+                    seen += 1
+                    for m in _RE_REVOLT_CUSTOM_EMO.finditer(raw.get("content") or ""):
+                        _note_emoji_use(m.group(1))
+                    for emoji in (raw.get("reactions") or {}):
+                        if _RE_STOAT_EMOJI_ID.fullmatch(emoji):
+                            _note_emoji_use(emoji)
+                before = str(batch[-1]["_id"])
+                if len(batch) < 100:
+                    break
+        logger.info(f"Emoji: usage recency rebuilt from {seen} recent mirrored message(s)")
 
     async def _run_health_check(self) -> None:
         """
@@ -1282,6 +1440,8 @@ class StoatBot(stoat.Client):
     async def on_message_react(self, event, /):
         if event.user_id == self.me.id:
             return  # our own Discord→Stoat mirror, don't loop
+        if _RE_STOAT_EMOJI_ID.fullmatch(event.emoji):
+            _note_emoji_use(event.emoji)  # a Stoat-side reaction counts toward recency
         discord_id, discord_msg_id = self._reaction_target(event)
         if discord_id is None:
             return
@@ -1532,20 +1692,28 @@ class DiscordBot(commands.Bot):
         """Mirror every custom emoji of the bridged guilds to the Stoat server.
 
         Already-mirrored emojis re-link by name (no state file – see the emoji
-        sync section); only genuinely new ones are uploaded.
+        sync section); only genuinely new ones are uploaded. Never evicts for
+        unused emojis: when the server's emoji slots are full, the bulk sync
+        stops – pruning only happens for actual uses (prune=True).
         """
         total = ok = 0
         for guild in self._bridged_guilds():
             for emoji in guild.emojis:
+                if _emoji_server_full:
+                    break
                 total += 1
-                if await ensure_stoat_emoji(emoji.name, emoji.id, emoji.animated, session):
+                if await ensure_stoat_emoji(
+                    emoji.name, emoji.id, emoji.animated, session, prune=False
+                ):
                     ok += 1
-                else:
-                    logger.warning(
-                        f"Emoji: bulk sync could not mirror :{emoji.name}: – it will retry on next use or reboot"
-                    )
                 await asyncio.sleep(0.5)  # stay clear of the bot rate limit
-        logger.info(f"Emoji: bulk sync done – {ok}/{total} guild emoji(s) available on Stoat")
+        if _emoji_server_full:
+            logger.info(
+                f"Emoji: bulk sync filled all free Stoat slots – {ok} mirrored, "
+                f"{total - ok} guild emoji(s) left unmirrored until slots free up"
+            )
+        else:
+            logger.info(f"Emoji: bulk sync done – {ok}/{total} guild emoji(s) available on Stoat")
 
     async def on_guild_emojis_update(self, guild, before, after):
         """New custom emojis on Discord are mirrored to Stoat right away."""
@@ -1558,7 +1726,7 @@ class DiscordBot(commands.Bot):
             if emoji in before:
                 continue  # unchanged or deleted
             await ensure_stoat_emoji(
-                emoji.name, emoji.id, emoji.animated, stoat_bot._http_session
+                emoji.name, emoji.id, emoji.animated, stoat_bot._http_session, prune=False
             )
 
     async def setup_hook(self):
