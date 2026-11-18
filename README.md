@@ -141,6 +141,8 @@ python backfill.py <discord_channel_id>
 
 The Discord channel ID must be one of the pairs in your `.env`. Run it **before** starting the bridge — messages the bridge already forwarded live will be duplicated. Old replies are not preserved as replies (they land as plain text). The script exits when done.
 
+`--resume` continues after the newest message the last run processed (state in `.backfill_state/`), so an interrupted run or a gap pass picks up exactly where it stopped.
+
 ---
 
 ### Configuration reference

@@ -3,10 +3,14 @@
 One-off backfill: copy a Discord channel's full history to its Stoat mirror.
 
 Usage:
-    python backfill.py <discord_channel_id>
+    python backfill.py <discord_channel_id> [--resume]
 
 Reads the same .env as bridge.py and uses the same formatting (nicknames via
 masquerade, mention/emoji resolution, attachment URLs appended as text).
+
+--resume continues after the newest Discord message the last run processed
+(state in .backfill_state/), so an interrupted run or a gap pass picks up
+exactly where it stopped.
 
 Run this BEFORE starting the bridge for a channel pair – messages the bridge
 already forwarded live will be duplicated.
@@ -15,6 +19,7 @@ already forwarded live will be duplicated.
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 import discord
 import stoat
@@ -25,8 +30,10 @@ import bridge  # noqa: E402 – needs the .env loaded before its module-level co
 
 logger = logging.getLogger("backfill")
 
+STATE_DIR = Path(".backfill_state")
 
-async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Client, discord_channel_id: int) -> None:
+
+async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Client, discord_channel_id: int, after_id: int | None = None) -> None:
     stoat_channel_id = bridge.DISCORD_TO_STOAT.get(discord_channel_id)
     if stoat_channel_id is None:
         raise SystemExit(
@@ -45,7 +52,11 @@ async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Clien
     }
 
     count = 0
-    async for msg in channel.history(limit=None, oldest_first=True):
+    last_seen = after_id
+    if after_id:
+        logger.info(f"resuming after Discord message {after_id}")
+    async for msg in channel.history(limit=None, oldest_first=True, after=after_id):
+        last_seen = msg.id
         if msg.author == discord_client.user or msg.webhook_id in own_webhook_ids:
             continue
         content = await bridge.clean_discord_content(msg.content or "", msg)
@@ -70,27 +81,36 @@ async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Clien
         if count % 100 == 0:
             logger.info(f"{count} messages backfilled…")
     logger.info(f"Done: {count} messages copied to Stoat channel {stoat_channel_id}")
+    STATE_DIR.mkdir(exist_ok=True)
+    (STATE_DIR / str(discord_channel_id)).write_text(str(last_seen or 0))
 
 
 class _BackfillStoat(stoat.Client):
-    def __init__(self, discord_client: discord.Client, discord_channel_id: int, **kwargs):
+    def __init__(self, discord_client: discord.Client, discord_channel_id: int, after_id: int | None, **kwargs):
         super().__init__(**kwargs)
         self._dc = discord_client
         self._discord_channel_id = discord_channel_id
+        self._after_id = after_id
 
     async def on_ready(self, event, /):
         try:
             await self._dc.wait_until_ready()
-            await run_backfill(self, self._dc, self._discord_channel_id)
+            await run_backfill(self, self._dc, self._discord_channel_id, self._after_id)
         finally:
             await self.close()
             await self._dc.close()
 
 
 async def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"Usage: python {sys.argv[0]} <discord_channel_id>")
-    discord_channel_id = int(sys.argv[1])
+    pos_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    resume = "--resume" in sys.argv
+    if len(pos_args) != 1:
+        raise SystemExit(f"Usage: python {sys.argv[0]} <discord_channel_id> [--resume]")
+    discord_channel_id = int(pos_args[0])
+    after_id = None
+    state_file = STATE_DIR / str(discord_channel_id)
+    if resume and state_file.exists() and state_file.read_text().strip() not in ("", "0"):
+        after_id = int(state_file.read_text().strip())
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -100,6 +120,7 @@ async def main() -> None:
     stoat_client = _BackfillStoat(
         discord_client,
         discord_channel_id,
+        after_id,
         token=bridge.STOAT_BOT_TOKEN,
         http_base=bridge.REVOLT_API_URL,
         websocket_base=bridge.REVOLT_WS_URL,
