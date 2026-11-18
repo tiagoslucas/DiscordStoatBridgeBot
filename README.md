@@ -25,8 +25,21 @@ The bridge caches the last **500** message ID pairs in memory (configurable). Re
 ### Mention & emoji resolution
 | Direction | What gets resolved |
 |---|---|
-| Discord → Stoat | `<@id>` → `@Nickname`, `<#id>` → `#channel-name`, `<@&id>` → `@role-name`, `<:n:id>` → `:n:` |
-| Stoat → Discord | `<@ULID>` → `@DisplayName`, `:ULID:` → `:emoji-name:` |
+| Discord → Stoat | `<@id>` → `@Nickname`, `<#id>` → `#channel-name`, `<@&id>` → `@role-name` |
+| Stoat → Discord | `<@ULID>` → `@DisplayName` |
+
+### Custom emojis
+Custom emojis are mirrored between the two servers on first use, so they render natively on both sides (in messages **and** reactions). Discord `<:name:id>` is uploaded to the Stoat server; Stoat `:ULID:` is created in the Discord guild. The id mapping is persisted to `emoji_map.json` next to `.env`, and emojis are also re-linked by name on startup — losing the map file never duplicates emojis.
+
+If the bot lacks the upload permissions (see below), emojis fall back to `:name:` text and custom-emoji reactions are skipped.
+
+### Reactions
+| Direction | Behaviour |
+|---|---|
+| Discord → Stoat | Bot reacts on the Stoat mirror with the same emoji (custom emojis mirrored as above) |
+| Stoat → Discord | Bot reacts on the Discord message with the same emoji |
+
+Reactions are added **as the bridge bot** — neither API offers masquerade for reactions, so the original reactor is not shown and counts are not carried over. Removing a reaction only removes the mirror once nobody on the other platform reacts with that emoji anymore. Like replies, reaction bridging only covers the last **500** bridged messages (the ID cache size).
 
 ---
 
@@ -101,6 +114,10 @@ Make sure your bot has the following permissions in the target channel:
 - Read Messages
 - Send Messages
 - Manage Webhooks
+- Add Reactions (reaction bridging)
+- Create Expressions (mirroring Stoat custom emojis into the guild)
+
+On the Stoat server the bot needs **React** and **Manage Custom Emoji** for the same features.
 
 ---
 
@@ -133,7 +150,7 @@ Same command – the bridge will find the existing `.env`, skip the setup wizard
 
 ### Backfill existing history
 
-`backfill.py` copies a Discord channel's **entire history** (oldest first) to its Stoat mirror, using the same formatting as live bridging (nicknames via masquerade, mention/emoji resolution, attachments as links).
+`backfill.py` copies a Discord channel's **entire history** (oldest first) to its Stoat mirror, using the same formatting as live bridging (nicknames via masquerade, mention resolution, custom emojis mirrored to the Stoat server, attachments as links).
 
 ```bash
 python backfill.py <discord_channel_id>

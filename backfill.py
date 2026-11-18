@@ -6,7 +6,8 @@ Usage:
     python backfill.py <discord_channel_id> [--resume]
 
 Reads the same .env as bridge.py and uses the same formatting (nicknames via
-masquerade, mention/emoji resolution, attachment URLs appended as text).
+masquerade, mention resolution, custom emojis mirrored to the Stoat server,
+attachment URLs appended as text).
 
 --resume continues after the newest Discord message the last run processed
 (state in .backfill_state/), so an interrupted run or a gap pass picks up
@@ -21,6 +22,7 @@ import logging
 import sys
 from pathlib import Path
 
+import aiohttp
 import discord
 import stoat
 from dotenv import load_dotenv
@@ -55,31 +57,35 @@ async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Clien
     last_seen = after_id
     if after_id:
         logger.info(f"resuming after Discord message {after_id}")
-    async for msg in channel.history(limit=None, oldest_first=True, after=after_id):
-        last_seen = msg.id
-        if msg.author == discord_client.user or msg.webhook_id in own_webhook_ids:
-            continue
-        content = await bridge.clean_discord_content(msg.content or "", msg)
-        for att in msg.attachments:
-            content += f" {att.url}"
-        if not content.strip():
-            continue
-        avatar_url = (
-            str(msg.author.avatar.url)
-            if msg.author.avatar
-            else str(msg.author.default_avatar.url)
-        )
-        # shortcut: replies are not preserved as replies, they land as plain text
-        await ch.send(
-            masquerade=stoat.Masquerade(
-                name=msg.author.display_name[:32],
-                avatar=avatar_url,
-            ),
-            content=content[:2000],
-        )
-        count += 1
-        if count % 100 == 0:
-            logger.info(f"{count} messages backfilled…")
+    session = aiohttp.ClientSession()
+    try:
+        async for msg in channel.history(limit=None, oldest_first=True, after=after_id):
+            last_seen = msg.id
+            if msg.author == discord_client.user or msg.webhook_id in own_webhook_ids:
+                continue
+            content = await bridge.clean_discord_content(msg.content or "", msg, session)
+            for att in msg.attachments:
+                content += f" {att.url}"
+            if not content.strip():
+                continue
+            avatar_url = (
+                str(msg.author.avatar.url)
+                if msg.author.avatar
+                else str(msg.author.default_avatar.url)
+            )
+            # shortcut: replies are not preserved as replies, they land as plain text
+            await ch.send(
+                masquerade=stoat.Masquerade(
+                    name=msg.author.display_name[:32],
+                    avatar=avatar_url,
+                ),
+                content=content[:2000],
+            )
+            count += 1
+            if count % 100 == 0:
+                logger.info(f"{count} messages backfilled…")
+    finally:
+        await session.close()
     logger.info(f"Done: {count} messages copied to Stoat channel {stoat_channel_id}")
     STATE_DIR.mkdir(exist_ok=True)
     (STATE_DIR / str(discord_channel_id)).write_text(str(last_seen or 0))

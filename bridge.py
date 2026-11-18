@@ -31,6 +31,7 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -610,7 +611,7 @@ async def edit_stoat_message(channel_id: str, message_id: str, content: str, sto
 _RE_DISCORD_USER    = re.compile(r"<@!?(\d+)>")
 _RE_DISCORD_CHANNEL = re.compile(r"<#(\d+)>")
 _RE_DISCORD_ROLE    = re.compile(r"<@&(\d+)>")
-_RE_DISCORD_EMOJI   = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
+_RE_DISCORD_EMOJI   = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")
 
 _RE_REVOLT_USER       = re.compile(r"<@([A-Z0-9]{26})>")
 _RE_REVOLT_CUSTOM_EMO = re.compile(r":([A-Z0-9]{26}):")
@@ -636,7 +637,219 @@ async def resolve_revolt_emoji(emoji_id: str, session: aiohttp.ClientSession, to
     return emoji_id
 
 
-async def clean_discord_content(content: str, message: discord.Message) -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+#  EMOJI SYNC  (custom emojis mirrored between the Discord guild and the Stoat
+#  server, so they render natively in messages and reactions on both sides)
+# ──────────────────────────────────────────────────────────────────────────────
+
+EMOJI_MAP_FILE = ENV_FILE.parent / "emoji_map.json"
+
+_emoji_d2s: dict[str, str] = {}   # discord emoji id → stoat emoji id
+_emoji_s2d: dict[str, str] = {}   # stoat emoji id → discord emoji id (as str)
+_emoji_map_loaded = False
+_emoji_lock_d2s = asyncio.Lock()  # serialize creation: two uses of a brand-new
+_emoji_lock_s2d = asyncio.Lock()  # emoji must not upload it twice
+_stoat_server_id: str | None = None
+
+
+def _load_emoji_map() -> None:
+    global _emoji_map_loaded
+    if _emoji_map_loaded:
+        return
+    _emoji_map_loaded = True
+    if not EMOJI_MAP_FILE.exists():
+        return
+    try:
+        data = json.loads(EMOJI_MAP_FILE.read_text(encoding="utf-8"))
+        _emoji_d2s.update({str(k): str(v) for k, v in (data.get("discord_to_stoat") or {}).items()})
+        _emoji_s2d.update({str(k): str(v) for k, v in (data.get("stoat_to_discord") or {}).items()})
+    except Exception as exc:
+        logger.warning(f"Could not load {EMOJI_MAP_FILE}: {exc}")
+
+
+def _save_emoji_map() -> None:
+    try:
+        EMOJI_MAP_FILE.write_text(
+            json.dumps({"discord_to_stoat": _emoji_d2s, "stoat_to_discord": _emoji_s2d}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning(f"Could not save {EMOJI_MAP_FILE}: {exc}")
+
+
+def _link_emoji(discord_id: int | str, stoat_id: str) -> None:
+    _emoji_d2s[str(discord_id)] = stoat_id
+    _emoji_s2d[stoat_id] = str(discord_id)
+    _save_emoji_map()
+
+
+async def _get_stoat_server_id(session: aiohttp.ClientSession) -> str | None:
+    """The Stoat server hosting the bridged channels (parent for created emojis)."""
+    global _stoat_server_id
+    if _stoat_server_id:
+        return _stoat_server_id
+    if session is None or not STOAT_CHANNEL_IDS:
+        return None
+    try:
+        async with session.get(
+            f"{REVOLT_API_URL}/channels/{STOAT_CHANNEL_IDS[0]}",
+            headers={"x-bot-token": STOAT_BOT_TOKEN},
+        ) as resp:
+            if resp.status == 200:
+                _stoat_server_id = (await resp.json()).get("server")
+    except Exception as exc:
+        logger.debug(f"Could not resolve Stoat server id: {exc}")
+    return _stoat_server_id
+
+
+async def ensure_stoat_emoji(
+    name: str, discord_emoji_id: int, animated: bool, session: aiohttp.ClientSession
+) -> str | None:
+    """Discord custom emoji → Stoat emoji id, uploading it to the Stoat server on first use."""
+    _load_emoji_map()
+    key = str(discord_emoji_id)
+    if key in _emoji_d2s:
+        return _emoji_d2s[key]
+    if session is None:
+        return None
+    async with _emoji_lock_d2s:
+        if key in _emoji_d2s:  # created while we waited on the lock
+            return _emoji_d2s[key]
+        try:
+            server_id = await _get_stoat_server_id(session)
+            if not server_id:
+                return None
+
+            # Reuse an existing Stoat emoji with the same name. The map file
+            # lives next to .env, which is RAM-only on overlayfs hosts and
+            # wiped on reboot – name matching re-links instead of duplicating.
+            async with session.get(
+                f"{REVOLT_API_URL}/servers/{server_id}/emojis",
+                headers={"x-bot-token": STOAT_BOT_TOKEN},
+            ) as resp:
+                if resp.status == 200:
+                    for e in await resp.json():
+                        if e.get("name") == name:
+                            stoat_id = _extract_id(e)
+                            if stoat_id:
+                                _link_emoji(key, stoat_id)
+                                return stoat_id
+
+            ext = "gif" if animated else "png"
+            fetched = await fetch_bytes(
+                session, f"https://cdn.discordapp.com/emojis/{discord_emoji_id}.{ext}?size=64"
+            )
+            if fetched is None:
+                return None
+            form = aiohttp.FormData()
+            form.add_field("file", fetched[0], filename=f"{name}.{ext}")
+            async with session.post(f"{REVOLT_CDN_URL}/emojis", data=form) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    logger.warning(f"Emoji: Stoat upload of :{name}: failed: HTTP {resp.status} – {body[:200]}")
+                    return None
+                attachment_id = (await resp.json()).get("id")
+            if not attachment_id:
+                return None
+            async with session.put(
+                f"{REVOLT_API_URL}/custom/emoji/{attachment_id}",
+                headers={"x-bot-token": STOAT_BOT_TOKEN},
+                json={"name": name, "parent": {"type": "Server", "id": server_id}},
+            ) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    logger.warning(f"Emoji: Stoat create of :{name}: failed: HTTP {resp.status} – {body[:200]}")
+                    return None
+                stoat_id = _extract_id(await resp.json())
+            if not stoat_id:
+                return None
+            _link_emoji(key, stoat_id)
+            logger.info(f"Emoji: mirrored Discord :{name}: to Stoat as {stoat_id}")
+            return stoat_id
+        except Exception as exc:
+            logger.warning(f"Emoji: could not mirror Discord :{name}: to Stoat: {exc}")
+            return None
+
+
+async def ensure_discord_emoji(
+    stoat_emoji_id: str, session: aiohttp.ClientSession, guild: "discord.Guild | None"
+) -> int | None:
+    """Stoat custom emoji → Discord emoji id, creating it in the bridged guild on first use."""
+    _load_emoji_map()
+    if stoat_emoji_id in _emoji_s2d:
+        return int(_emoji_s2d[stoat_emoji_id])
+    if guild is None:
+        return None
+    async with _emoji_lock_s2d:
+        if stoat_emoji_id in _emoji_s2d:  # created while we waited on the lock
+            return int(_emoji_s2d[stoat_emoji_id])
+        try:
+            name = await resolve_revolt_emoji(stoat_emoji_id, session, STOAT_BOT_TOKEN)
+            # Reuse by name first – same reboot-resilience as the Stoat side.
+            existing = discord.utils.get(guild.emojis, name=name)
+            if existing is None:
+                fetched = await fetch_bytes(session, f"{REVOLT_CDN_URL}/emojis/{stoat_emoji_id}")
+                if fetched is None:
+                    return None
+                safe_name = re.sub(r"[^A-Za-z0-9_]", "_", name)[:32] or "emoji"
+                existing = await guild.create_custom_emoji(name=safe_name, image=fetched[0])
+                logger.info(f"Emoji: mirrored Stoat :{name}: to Discord as {existing.id}")
+            _link_emoji(existing.id, stoat_emoji_id)
+            return existing.id
+        except Exception as exc:
+            logger.warning(f"Emoji: could not mirror Stoat emoji {stoat_emoji_id} to Discord: {exc}")
+            return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  REACTION REST HELPERS  (the bot's own reaction is the mirror – the APIs
+#  offer no masquerade for reactions, so attribution and counts are not carried)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _stoat_set_reaction(
+    session: aiohttp.ClientSession, channel_id: str, message_id: str, emoji: str, *, add: bool
+) -> None:
+    """Add/remove the bot's own reaction on a Stoat message. emoji is a unicode emoji or a bare Stoat emoji id."""
+    url = (
+        f"{REVOLT_API_URL}/channels/{channel_id}/messages/{message_id}"
+        f"/reactions/{quote(emoji, safe='')}"
+    )
+    try:
+        async with (session.put if add else session.delete)(
+            url, headers={"x-bot-token": STOAT_BOT_TOKEN}
+        ) as resp:
+            if resp.status not in (200, 204):
+                body = await resp.text()
+                logger.warning(f"Stoat reaction HTTP {resp.status} for {emoji}: {body[:150]}")
+    except Exception as exc:
+        logger.warning(f"Stoat reaction error for {emoji}: {exc}")
+
+
+async def _stoat_fetch_reactions(
+    session: aiohttp.ClientSession, channel_id: str, message_id: str
+) -> dict[str, list[str]]:
+    """Current reactions of a Stoat message: {emoji: [user ids]}."""
+    if session is None:
+        return {}
+    try:
+        async with session.get(
+            f"{REVOLT_API_URL}/channels/{channel_id}/messages/{message_id}",
+            headers={"x-bot-token": STOAT_BOT_TOKEN},
+        ) as resp:
+            if resp.status == 200:
+                return (await resp.json()).get("reactions") or {}
+    except Exception as exc:
+        logger.debug(f"Could not fetch Stoat reactions for {message_id}: {exc}")
+    return {}
+
+
+_RE_STOAT_EMOJI_ID = re.compile(r"[A-Z0-9]{26}")
+
+
+async def clean_discord_content(
+    content: str, message: discord.Message, session: aiohttp.ClientSession | None = None
+) -> str:
     """Resolve Discord markup to plain text before forwarding to Stoat."""
     guild  = message.guild
     result = content
@@ -666,7 +879,21 @@ async def clean_discord_content(content: str, message: discord.Message) -> str:
         return f"@{role.name}" if role else "@role"
 
     result = _RE_DISCORD_ROLE.sub(_role, result)
-    result = _RE_DISCORD_EMOJI.sub(lambda m: f":{m.group(1)}:", result)
+
+    # custom emojis: mirror to Stoat so they render natively (:name: text is
+    # the fallback when the emoji could not be mirrored)
+    matches = list(_RE_DISCORD_EMOJI.finditer(result))
+    if matches:
+        stoat_ids = await asyncio.gather(
+            *[
+                ensure_stoat_emoji(m.group(2), int(m.group(3)), m.group(1) == "a", session)
+                for m in matches
+            ]
+        )
+        for m, sid in zip(reversed(matches), reversed(stoat_ids)):
+            repl = f":{sid}:" if sid else f":{m.group(2)}:"
+            result = result[: m.start()] + repl + result[m.end():]
+
     return result
 
 
@@ -674,6 +901,7 @@ async def clean_stoat_content(
     content: str,
     session: aiohttp.ClientSession,
     token: str,
+    guild: "discord.Guild | None" = None,
 ) -> str:
     """Resolve Stoat markup to plain text before forwarding to Discord."""
     result = content
@@ -698,8 +926,12 @@ async def clean_stoat_content(
         names = await asyncio.gather(
             *[resolve_revolt_emoji(m.group(1), session, token) for m in matches]
         )
-        for m, name in zip(reversed(matches), reversed(names)):
-            result = result[: m.start()] + f":{name}:" + result[m.end() :]
+        d_ids = await asyncio.gather(
+            *[ensure_discord_emoji(m.group(1), session, guild) for m in matches]
+        )
+        for m, name, d_id in zip(reversed(matches), reversed(names), reversed(d_ids)):
+            repl = f"<:{name}:{d_id}>" if d_id else f":{name}:"
+            result = result[: m.start()] + repl + result[m.end() :]
 
     return result
 
@@ -881,7 +1113,7 @@ class StoatBot(stoat.Client):
 
         # ── Clean content ─────────────────────────────────────────────────────
         content = await clean_stoat_content(
-            msg.content or "", self._http_session, STOAT_BOT_TOKEN
+            msg.content or "", self._http_session, STOAT_BOT_TOKEN, guild=webhook.guild
         )
 
         # ── Reply → quote fallback ────────────────────────────────────────────
@@ -975,6 +1207,95 @@ class StoatBot(stoat.Client):
             _webhook_discord_ids.discard(discord_msg_id)
         except Exception as exc:
             logger.error(f"on_message_delete (Stoat): unexpected error: {exc}")
+
+    # ── Reactions: Stoat → Discord ─────────────────────────────────────────────
+
+    async def on_message_react(self, event, /):
+        if event.user_id == self.me.id:
+            return  # our own Discord→Stoat mirror, don't loop
+        discord_id, discord_msg_id = self._reaction_target(event)
+        if discord_id is None:
+            return
+        channel = self._discord_bot.get_channel(discord_id) if self._discord_bot else None
+        if channel is None:
+            return
+        emoji = await self._discord_reaction_emoji(event.emoji, channel.guild)
+        if emoji is None:
+            return  # unmapped custom emoji – nothing to react with
+        try:
+            await channel.get_partial_message(discord_msg_id).add_reaction(emoji)
+        except discord.HTTPException as exc:
+            logger.warning(f"Stoat -> Discord: reaction add failed: {exc}")
+
+    async def on_message_unreact(self, event, /):
+        if event.user_id == self.me.id:
+            return  # triggered by our own Discord→Stoat mirror removal
+        discord_id, discord_msg_id = self._reaction_target(event)
+        if discord_id is None:
+            return
+        # keep the Discord mirror while anyone on Stoat still reacts with it
+        users = (
+            await _stoat_fetch_reactions(
+                self._http_session, str(event.channel_id), str(event.message_id)
+            )
+        ).get(event.emoji) or []
+        if users:
+            return
+        await self._remove_discord_reaction(event, discord_id, discord_msg_id)
+
+    async def on_message_remove_reaction(self, event, /):
+        # a moderator removed a reaction – same reconcile as a plain unreact
+        await self.on_message_unreact(event)
+
+    async def on_message_clear_reaction(self, event, /):
+        discord_id, discord_msg_id = self._reaction_target(event)
+        if discord_id is None:
+            return
+        await self._remove_discord_reaction(event, discord_id, discord_msg_id)
+
+    def _reaction_target(self, event) -> tuple[int | None, int]:
+        """(discord channel id, discord message id) for a Stoat reaction event, or (None, 0)."""
+        discord_id = STOAT_TO_DISCORD.get(str(event.channel_id))
+        discord_msg_id = _s2d.get(str(event.message_id))
+        if discord_id is None or discord_msg_id is None:
+            return None, 0  # not a bridged message, or older than the ID cache
+        return discord_id, discord_msg_id
+
+    async def _remove_discord_reaction(self, event, discord_id: int, discord_msg_id: int) -> None:
+        channel = self._discord_bot.get_channel(discord_id) if self._discord_bot else None
+        if channel is None or self._discord_bot is None:
+            return
+        emoji = await self._discord_reaction_emoji(event.emoji, channel.guild, create=False)
+        if emoji is None:
+            return
+        try:
+            await channel.get_partial_message(discord_msg_id).remove_reaction(
+                emoji, self._discord_bot.user
+            )
+        except discord.NotFound:
+            pass  # we never mirrored that one
+        except discord.HTTPException as exc:
+            logger.warning(f"Stoat -> Discord: reaction remove failed: {exc}")
+
+    async def _discord_reaction_emoji(
+        self, stoat_emoji: str, guild: "discord.Guild | None", create: bool = True
+    ):
+        """Map a Stoat reaction emoji (unicode or custom ULID) to a Discord emoji."""
+        if not _RE_STOAT_EMOJI_ID.fullmatch(stoat_emoji):
+            return stoat_emoji  # unicode emoji, passes straight through
+        name = await resolve_revolt_emoji(stoat_emoji, self._http_session, STOAT_BOT_TOKEN)
+        _load_emoji_map()
+        d_id: int | None = None
+        if create:
+            d_id = await ensure_discord_emoji(stoat_emoji, self._http_session, guild)
+        else:
+            mapped = _emoji_s2d.get(stoat_emoji)
+            if mapped:
+                d_id = int(mapped)
+            else:
+                existing = discord.utils.get(guild.emojis, name=name) if guild else None
+                d_id = existing.id if existing else None
+        return discord.PartialEmoji(name=name, id=d_id) if d_id else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1081,7 +1402,8 @@ class DiscordBot(commands.Bot):
             return
 
         # ── Content ───────────────────────────────────────────────────────────
-        content = await clean_discord_content(message.content or "", message)
+        stoat_session = self._stoat_bot._http_session if self._stoat_bot else None
+        content = await clean_discord_content(message.content or "", message, stoat_session)
 
         # ── Reply ─────────────────────────────────────────────────────────────
         stoat_replies: list = []
@@ -1179,9 +1501,9 @@ class DiscordBot(commands.Bot):
             for t in content.split()
         )
 
-    async def _fingerprint(self, message: discord.Message) -> tuple[str, str]:
+    async def _fingerprint(self, message: discord.Message, session=None) -> tuple[str, str]:
         """Stable (name, content) fingerprint of a Discord message as archived."""
-        content = await clean_discord_content(message.content or "", message)
+        content = await clean_discord_content(message.content or "", message, session)
         for att in message.attachments:
             content += f" {att.url}"
         return message.author.display_name[:32], self._fp_normalize(content)[:2000]
@@ -1244,7 +1566,7 @@ class DiscordBot(commands.Bot):
                         highwater = msg.id
                     if msg.author == self.user or msg.webhook_id is not None:
                         continue
-                    name, content = await self._fingerprint(msg)
+                    name, content = await self._fingerprint(msg, session)
                     if (name, content) in known:
                         matched = True
                         break
@@ -1307,6 +1629,69 @@ class DiscordBot(commands.Bot):
             f"~~{line}~~" if line.strip() else line for line in content.split("\n")
         )
         await edit_stoat_message(stoat_ch_id, stoat_msg_id, struck, self._stoat_bot)
+
+    # ── Reactions: Discord → Stoat ─────────────────────────────────────────────
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        await self._mirror_reaction_to_stoat(payload, add=True)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        # only drop the Stoat mirror once nobody on Discord reacts with it anymore
+        try:
+            channel = self.get_channel(payload.channel_id)
+            if channel is not None:
+                msg = await channel.fetch_message(payload.message_id)
+                reaction = discord.utils.get(msg.reactions, emoji=payload.emoji)
+                if reaction is not None and reaction.count > 0:
+                    return
+        except discord.HTTPException:
+            pass  # message gone or unreadable – mirror the removal anyway
+        await self._mirror_reaction_to_stoat(payload, add=False)
+
+    async def on_raw_reaction_clear_emoji(self, payload: discord.RawReactionClearEmojiEvent):
+        await self._mirror_reaction_to_stoat(payload, add=False)
+
+    async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent):
+        stoat_bot = self._stoat_bot
+        stoat_ch_id = DISCORD_TO_STOAT.get(payload.channel_id)
+        stoat_msg_id = _d2s.get(payload.message_id)
+        if stoat_bot is None or stoat_bot._http_session is None:
+            return
+        if stoat_ch_id is None or stoat_msg_id is None:
+            return
+        # drop every one of the bot's own reactions on the Stoat mirror
+        me = _extract_id(stoat_bot.me)
+        for emoji, users in (
+            await _stoat_fetch_reactions(stoat_bot._http_session, stoat_ch_id, stoat_msg_id)
+        ).items():
+            if me in users:
+                await _stoat_set_reaction(
+                    stoat_bot._http_session, stoat_ch_id, stoat_msg_id, emoji, add=False
+                )
+
+    async def _mirror_reaction_to_stoat(self, payload, *, add: bool) -> None:
+        if getattr(payload, "user_id", None) == self.user.id:
+            return  # our own Stoat→Discord mirror, don't loop
+        stoat_ch_id = DISCORD_TO_STOAT.get(payload.channel_id)
+        stoat_msg_id = _d2s.get(payload.message_id)
+        if stoat_ch_id is None or stoat_msg_id is None:
+            return  # not a bridged message, or older than the ID cache
+        stoat_bot = self._stoat_bot
+        if stoat_bot is None or stoat_bot._http_session is None:
+            return
+        emoji = payload.emoji
+        if emoji.id:
+            stoat_emoji = await ensure_stoat_emoji(
+                emoji.name, emoji.id, emoji.animated, stoat_bot._http_session
+            )
+            if stoat_emoji is None:
+                return  # can't react with an unmapped custom emoji
+            emoji_str = stoat_emoji
+        else:
+            emoji_str = emoji.name
+        await _stoat_set_reaction(
+            stoat_bot._http_session, stoat_ch_id, stoat_msg_id, emoji_str, add=add
+        )
 
     # ── Channel lifecycle: Discord → Stoat ────────────────────────────────────
     #  Channels created on Stoat are NOT created on Discord, and channels
