@@ -171,6 +171,7 @@ The Discord channel ID must be one of the pairs in your `.env`. Run it **before*
   - A text channel created on Discord is automatically created on Stoat, bridged, and persisted to `.env` (so it survives restarts).
   - Channels created on Stoat are **not** created on Discord.
   - Channels deleted on either side are **not** deleted on the other.
+- **Startup catch-up:** on start (and after every Stoat reconnect) the bridge reads the newest bot-authored messages from each Stoat mirror, walks the Discord history backwards until it finds a message that is already archived, and forwards everything newer — so messages sent while the bridge was down (crash, reboot, Stoat outage) still reach the archive without duplicates. Matching is by nickname + normalized content; if no overlap is found within 500 messages the channel is skipped with a warning rather than risk duplication.
 - Stoat custom emoji names are resolved via the Stoat API and cached in memory for the duration of the process.
 - First-time users on both platforms receive a one-time DM explaining what the bridge does and how their messages are handled.
 

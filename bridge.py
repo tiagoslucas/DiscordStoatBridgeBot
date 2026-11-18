@@ -714,6 +714,7 @@ class StoatBot(stoat.Client):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._http_session: aiohttp.ClientSession | None = None
+        self._discord_bot: "DiscordBot | None" = None  # set in main(); triggers catch-up
         self._healthpulse: bool = False
         self._health_msg_id: str | None = None
         self._planned_restart: bool = False  # set by _do_restart(); read by the supervisor in main()
@@ -734,6 +735,11 @@ class StoatBot(stoat.Client):
                 logger.error(f"Stoat: could not fetch channel {stoat_id} - {exc}")
 
         await self._run_health_check()
+
+        # After (re)connecting, catch up on Discord messages missed while the
+        # Stoat session was down.
+        if self._discord_bot is not None and not self._planned_restart:
+            self._discord_bot._maybe_start_catchup()
 
     async def _run_health_check(self) -> None:
         """
@@ -989,6 +995,12 @@ class DiscordBot(commands.Bot):
         # Set by the Stoat supervisor in main(); used to edit Stoat messages
         self._stoat_bot: StoatBot | None = None
 
+        # Startup catch-up state (see run_catchup)
+        self._catching_up = False
+        self._catchup_running = False
+        self._pending: list[discord.Message] = []
+        self._catchup_highwater: dict[int, int] = {}
+
     async def setup_hook(self):
         self.loop.create_task(self._setup_webhooks())
 
@@ -1012,6 +1024,7 @@ class DiscordBot(commands.Bot):
     async def on_ready(self):
         logger.info(f"Discord: connected as {self.user}")
         logger.info(f"Discord: bridging {PAIR_COUNT} channel pair(s)")
+        self._maybe_start_catchup()
 
     # ── Send a DM on Discord ──────────────────────────────────────────────────
 
@@ -1042,6 +1055,18 @@ class DiscordBot(commands.Bot):
         discord_id = message.channel.id
         if discord_id not in DISCORD_TO_STOAT:
             return
+
+        # Queue live messages while a catch-up pass runs, so the walk and the
+        # queue can never forward the same message twice.
+        if self._catching_up:
+            self._pending.append(message)
+            return
+
+        await self._bridge_message(message)
+
+    async def _bridge_message(self, message: discord.Message):
+        """Forward one Discord message to its Stoat mirror (live or catch-up)."""
+        discord_id = message.channel.id
 
         # ── First-time DM ─────────────────────────────────────────────────────
         uid = str(message.author.id)
@@ -1123,6 +1148,139 @@ class DiscordBot(commands.Bot):
                 )
         except Exception as exc:
             logger.error(f"Discord -> Stoat (channel {stoat_id}): {exc}")
+
+    # ── Startup catch-up: Discord → Stoat ─────────────────────────────────────
+
+    def _maybe_start_catchup(self) -> None:
+        """Start a catch-up pass once both sides are connected."""
+        if self._catchup_running or self._catching_up:
+            return
+        stoat_bot = self._stoat_bot
+        if (
+            stoat_bot is None
+            or stoat_bot._http_session is None
+            or not stoat_channels
+            or not self.is_ready()
+        ):
+            return
+        self._catchup_running = True
+        asyncio.create_task(self.run_catchup(stoat_bot))
+
+    @staticmethod
+    def _fp_normalize(content: str) -> str:
+        """Normalize message content for catch-up matching: drop the
+        reply-quote line (native replies and quote fallbacks must compare
+        equal) and URL query strings (Discord attachment URLs are signed and
+        differ between fetches)."""
+        if content.startswith("-# ↩ "):
+            content = content.split("\n", 1)[1] if "\n" in content else ""
+        return " ".join(
+            t.split("?", 1)[0] if t.startswith("http") else t
+            for t in content.split()
+        )
+
+    async def _fingerprint(self, message: discord.Message) -> tuple[str, str]:
+        """Stable (name, content) fingerprint of a Discord message as archived."""
+        content = await clean_discord_content(message.content or "", message)
+        for att in message.attachments:
+            content += f" {att.url}"
+        return message.author.display_name[:32], self._fp_normalize(content)[:2000]
+
+    async def run_catchup(self, stoat_bot: "StoatBot") -> None:
+        """Forward Discord messages sent while the bridge (or Stoat) was down.
+
+        The newest bot-authored Stoat messages are the record of what is
+        already archived; walk the Discord history backwards until a message
+        matches one, then bridge everything newer, oldest first. Reading the
+        watermark from Stoat itself (not a local file) keeps this correct
+        across crashes and reboots.
+        """
+        self._catching_up = True
+        self._catchup_highwater = {}
+        logger.info("Catch-up: scanning for messages missed while the bridge was down")
+        try:
+            session = stoat_bot._http_session
+            headers = {"x-bot-token": STOAT_BOT_TOKEN}
+            for stoat_id, discord_id in DISCORD_TO_STOAT.items():
+                channel = self.get_channel(discord_id)
+                ch = stoat_channels.get(stoat_id)
+                if channel is None or ch is None:
+                    continue
+
+                # 1. fingerprints of what is already on the Stoat mirror
+                known: set[tuple[str, str]] = set()
+                try:
+                    async with session.get(
+                        f"{REVOLT_API_URL}/channels/{stoat_id}/messages?limit=100&sort=Latest",
+                        headers=headers,
+                    ) as resp:
+                        if resp.status == 200:
+                            for m in await resp.json():
+                                masq = m.get("masquerade") or {}
+                                if masq.get("name") is not None:
+                                    known.add(
+                                        (masq["name"], self._fp_normalize(m.get("content") or ""))
+                                    )
+                except Exception as exc:
+                    logger.error(f"Catch-up: could not read Stoat channel {stoat_id}: {exc}")
+                    continue
+                if not known:
+                    # shortcut: empty mirror (new pair) or unreadable – forwarding
+                    # blind would duplicate a healthy archive, so do nothing
+                    logger.warning(
+                        f"Catch-up: no recent bot messages in Stoat channel {stoat_id} – skipped"
+                    )
+                    continue
+
+                # 2. walk Discord history backwards until an archived message matches.
+                #    shortcut: webhook messages are never matched or forwarded (ours
+                #    would loop); a foreign webhook message sent during downtime is
+                #    missed – upgrade to per-webhook filtering if that matters
+                missed: list[discord.Message] = []
+                highwater = 0
+                matched = False
+                async for msg in channel.history(limit=500):
+                    if highwater == 0:
+                        highwater = msg.id
+                    if msg.author == self.user or msg.webhook_id is not None:
+                        continue
+                    name, content = await self._fingerprint(msg)
+                    if (name, content) in known:
+                        matched = True
+                        break
+                    if not content.strip():
+                        continue
+                    missed.append(msg)
+                self._catchup_highwater[discord_id] = highwater
+
+                if not matched:
+                    if missed:
+                        # fail safe: a miss is better than mass duplication
+                        logger.warning(
+                            f"Catch-up: no overlap found in #{channel.name} within 500 "
+                            f"messages – nothing forwarded; run a manual "
+                            f"backfill --resume if the gap is real"
+                        )
+                    continue
+
+                # 3. forward what was missed, oldest first
+                for msg in reversed(missed):
+                    await self._bridge_message(msg)
+                if missed:
+                    logger.info(f"Catch-up: #{channel.name}: forwarded {len(missed)} missed message(s)")
+        finally:
+            self._catchup_running = False
+            # flush live messages queued while the walks ran; anything the walk
+            # already covered (id <= highwater) is skipped
+            while self._pending:
+                message = self._pending.pop(0)
+                if message.id > self._catchup_highwater.get(message.channel.id, 0):
+                    try:
+                        await self._bridge_message(message)
+                    except Exception as exc:
+                        logger.error(f"Catch-up flush: {message.id}: {exc}")
+            self._catching_up = False
+            logger.info("Catch-up: done, live bridging resumed")
 
     # ── Message deletion: Discord → strikethrough on Stoat ────────────────────
 
@@ -1251,6 +1409,7 @@ async def _run_stoat_supervisor(discord_bot: "DiscordBot") -> None:
             http_base=REVOLT_API_URL,
             websocket_base=REVOLT_WS_URL,
         )
+        stoat_bot._discord_bot = discord_bot
         discord_bot._stoat_bot = stoat_bot
 
         planned = False
