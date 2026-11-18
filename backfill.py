@@ -36,6 +36,11 @@ logger = logging.getLogger("backfill")
 STATE_DIR = Path(".backfill_state")
 
 
+def _save_state(discord_channel_id: int, last_seen: int | None) -> None:
+    STATE_DIR.mkdir(exist_ok=True)
+    (STATE_DIR / str(discord_channel_id)).write_text(str(last_seen or 0))
+
+
 async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Client, discord_channel_id: int, after_id: int | None = None) -> None:
     stoat_channel_id = bridge.DISCORD_TO_STOAT.get(discord_channel_id)
     if stoat_channel_id is None:
@@ -88,13 +93,15 @@ async def run_backfill(stoat_client: stoat.Client, discord_client: discord.Clien
                     msg.reactions, session, stoat_channel_id, sent_id
                 )
             count += 1
+            # persist per message (tmpfs): a killed run resumes without
+            # re-copying, instead of losing the whole channel's progress
+            _save_state(discord_channel_id, last_seen)
             if count % 100 == 0:
                 logger.info(f"{count} messages backfilled…")
     finally:
         await session.close()
     logger.info(f"Done: {count} messages copied to Stoat channel {stoat_channel_id}")
-    STATE_DIR.mkdir(exist_ok=True)
-    (STATE_DIR / str(discord_channel_id)).write_text(str(last_seen or 0))
+    _save_state(discord_channel_id, last_seen)
 
 
 class _BackfillStoat(stoat.Client):
